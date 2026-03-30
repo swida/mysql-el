@@ -6,14 +6,22 @@ LD      = gcc
 CFLAGS  = -ggdb3 -Wall
 LDFLAGS =
 
+SRCS = mysql-el.c
+OBJS = $(SRCS:.c=.o)
+
 all: mysql-el.so mysql-el.info
 
-%.so: %.o
-	$(LD) -shared $(LDFLAGS) -o $@ $< -L$(MYSQL_DIR)/lib -lmysqlclient
+mysql-el.so: $(OBJS)
+	$(LD) -shared $(LDFLAGS) -o $@ $(OBJS) -L$(MYSQL_DIR)/lib -lmysqlclient
 
 %.o: %.c
-	$(CC) $(CFLAGS) -I$(ROOT)/src  -I$(MYSQL_DIR)/include -fPIC -c $<
+	$(CC) $(CFLAGS) -I$(ROOT)/src -I$(MYSQL_DIR)/include -fPIC -c $<
 
 %.info: %.texi
 	makeinfo $< -o $@
+
+clean:
+	rm -f $(OBJS) *.so *.info
+
+.PHONY: all clean
 

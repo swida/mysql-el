@@ -32,22 +32,56 @@
 
 ### 前置依赖
 
-- GNU Emacs（带动态模块支持，即编译时 `--with-modules`）
-- MySQL 客户端库（`libmysqlclient`）
+- GNU Emacs 源码（带动态模块支持，即编译时 `--with-modules`）——编译本模块需要 Emacs 的 C 头文件（`emacs-module.h` 等）
+- MySQL 客户端库（`libmysqlclient`）及其头文件
 - GCC
+- `makeinfo`（Texinfo，用于生成 `.info` 文档）
+
+### 配置 Makefile
+
+编译前需要修改 `Makefile` 顶部的两个路径变量，使其指向你的环境：
+
+```makefile
+# Emacs 源码根目录（需要其中的 src/emacs-module.h）
+ROOT = $(HOME)/emacs
+
+# MySQL 安装目录（需要其中的 include/ 和 lib/）
+MYSQL_DIR = $(HOME)/mysqlinst
+```
+
+| 变量 | 说明 | 需要的内容 |
+|------|------|-----------|
+| `ROOT` | Emacs 源码根目录 | 该目录下应存在 `src/emacs-module.h` |
+| `MYSQL_DIR` | MySQL 安装目录 | 该目录下应存在 `include/mysql.h` 和 `lib/libmysqlclient.so` |
+
+例如，如果你的 Emacs 源码在 `/opt/emacs-30`，MySQL 安装在 `/usr/local/mysql`，则修改为：
+
+```makefile
+ROOT = /opt/emacs-30
+MYSQL_DIR = /usr/local/mysql
+```
 
 ### 编译
 
 ```bash
-cd modules/mysql-el
+cd mysql-el
 
 # 如果 MySQL 安装在非标准路径，先导出库路径
-export LD_LIBRARY_PATH=$HOME/mysqlinst/lib
+export LD_LIBRARY_PATH=$MYSQL_DIR/lib   # 按你的实际路径
 
 make
 ```
 
-编译成功后会生成 `mysql-el.so`。
+编译成功后会生成：
+- `mysql-el.o` — 目标文件
+- `mysql-el.so` — 动态模块（加载到 Emacs 中使用）
+- `mysql-el.info` — Info 格式文档
+
+清理编译产物：
+
+```bash
+make clean
+```
 
 ### 加载模块
 
@@ -558,15 +592,15 @@ make
 mysql -u root -e "CREATE DATABASE IF NOT EXISTS emacs_test"
 
 # 2. 编译模块
-cd modules/mysql-el
+cd mysql-el
 make
 
 # 3. 运行全部测试
-export LD_LIBRARY_PATH=$HOME/mysqlinst/lib
-run-emacs -batch -L . -l ert -l test.el -f ert-run-tests-batch-and-exit
+export LD_LIBRARY_PATH=$MYSQL_DIR/lib   # 按你的实际 MySQL 路径
+emacs -batch -L . -l ert -l test.el -f ert-run-tests-batch-and-exit
 
 # 4. 运行指定测试（按名称正则匹配）
-run-emacs -batch -L . -l ert -l test.el \
+emacs -batch -L . -l ert -l test.el \
   --eval '(ert-run-tests-batch-and-exit "mysql-param")'
 ```
 
