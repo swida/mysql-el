@@ -1,0 +1,837 @@
+\input texinfo   @c -*- texinfo -*-
+@c %**start of header
+@setfilename mysql-el.info
+@settitle mysql-el --- Emacs MySQL Dynamic Module
+@documentencoding UTF-8
+@c %**end of header
+
+@ifnottex
+@node Top
+@top mysql-el
+
+This manual describes the @code{mysql-el} Emacs dynamic module, which
+provides native MySQL client access from Emacs Lisp.
+@end ifnottex
+
+@menu
+* MySQL Database::  MySQL Database Access.
+@end menu
+
+@node MySQL Database
+@chapter MySQL Database Access
+@cindex database access, MySQL
+@cindex MySQL module
+
+  Emacs can access MySQL databases through the @code{mysql-el} dynamic
+module.  This module provides a set of Lisp functions whose interface is
+modeled after the built-in SQLite support (@ref{Database,,, elisp}).  This
+chapter describes the facilities available for accessing MySQL databases
+from Lisp programs.
+
+  To use this module, you must first compile it and load the resulting
+shared library into Emacs.  @xref{Loading the Module}.
+
+@menu
+* Loading the Module::       How to build and load the MySQL module.
+* MySQL Connection::         Opening and closing database connections.
+* MySQL Execution::          Executing SQL statements.
+* MySQL Queries::            Selecting data from the database.
+* MySQL Set Objects::        Lazy cursor iteration over result sets.
+* MySQL Batch Execution::    Running multiple statements at once.
+* MySQL Transactions::       Transaction support.
+* MySQL Utility Functions::  Escaping strings and version information.
+* MySQL Type Mapping::       How types are mapped between Emacs Lisp and MySQL.
+* MySQL Complete Example::   A complete example from start to finish.
+@end menu
+
+@node Loading the Module
+@section Loading the Module
+@cindex loading MySQL module
+
+  The @code{mysql-el} module must be compiled from C source before use.
+It requires the MySQL client library (@code{libmysqlclient}) and an
+Emacs binary built with dynamic module support (@option{--with-modules}).
+
+To compile:
+
+@example
+cd modules/mysql-el
+make
+@end example
+
+If the MySQL client library is installed in a non-standard location, you
+may need to set @env{LD_LIBRARY_PATH} before running Emacs:
+
+@example
+export LD_LIBRARY_PATH=$HOME/mysqlinst/lib
+@end example
+
+To load the module in Emacs:
+
+@lisp
+(module-load "/path/to/mysql-el.so")
+@end lisp
+
+@noindent
+After loading, the module provides the @code{mysql-el} feature:
+
+@lisp
+(require 'mysql-el)
+@end lisp
+
+@defun mysql-available-p
+This function returns non-@code{nil} if the MySQL module has been
+loaded and is available in the current Emacs session.
+@end defun
+
+@node MySQL Connection
+@section Opening and Closing Connections
+@cindex MySQL connection
+
+@cindex database object, MySQL
+@defun mysql-open host user password &optional database port
+Open a connection to a MySQL server and return a @dfn{database object}.
+@var{host} is the hostname or IP address of the MySQL server (e.g.,
+@code{"127.0.0.1"}).  @var{user} and @var{password} are the
+authentication credentials; pass an empty string @code{""} for
+@var{password} if no password is required.
+
+The optional @var{database} argument, if non-@code{nil}, specifies the
+default database to use.  The optional @var{port} argument, if
+non-@code{nil}, specifies the TCP port number (default is 3306).
+
+The connection is automatically configured to use the @code{utf8mb4}
+character set, so that Unicode strings (including emoji and CJK
+characters) round-trip correctly.  The connection also enables
+multi-statement mode, which is required for @code{mysql-execute-batch}.
+
+The returned database object can be used as the first argument to all
+the subsequent functions described in this chapter.  If the object is
+garbage-collected, the underlying MySQL connection is automatically
+closed.
+
+@lisp
+;; Minimal: connect with 3 required arguments.
+(setq db (mysql-open "127.0.0.1" "root" ""))
+
+;; Full: specify database and port.
+(setq db (mysql-open "127.0.0.1" "root" "secret" "mydb" 3306))
+@end lisp
+@end defun
+
+@defun mysqlp object
+This predicate returns non-@code{nil} if @var{object} is a live MySQL
+database object.  The database object returned by @code{mysql-open}
+satisfies this predicate.  After @code{mysql-close} has been called on
+the object, or if @var{object} is not a database handle at all, this
+function returns @code{nil}.
+
+@lisp
+(mysqlp db)       @result{} t
+(mysqlp "hello")  @result{} nil
+(mysqlp 42)       @result{} nil
+@end lisp
+@end defun
+
+@defun mysql-close db
+Close the database connection @var{db}.  After closing, any attempt to
+use @var{db} with other MySQL functions will signal an error.  It is
+usually not necessary to call this function explicitly---the connection
+will automatically be closed if Emacs shuts down or the database object
+is garbage-collected.
+
+@lisp
+(mysql-close db)  @result{} t
+@end lisp
+@end defun
+
+@node MySQL Execution
+@section Executing SQL Statements
+@cindex executing SQL, MySQL
+
+@defun mysql-execute db query &optional values
+Execute the @acronym{SQL} @var{query} on @var{db}.  For instance:
+
+@lisp
+(mysql-execute db "insert into foo values ('bar', 2)")
+@end lisp
+
+If the optional @var{values} parameter is present, it should be a list
+of values to bind to the @samp{?} placeholders in @var{query} using a
+prepared statement.  For instance:
+
+@lisp
+(mysql-execute db "insert into foo values (?, ?)" '("bar" 2))
+@end lisp
+
+This has exactly the same effect as the previous example, but is more
+efficient and safer (because it doesn't involve any string parsing or
+interpolation).
+
+The supported types for bind parameters are: strings, integers,
+floating-point numbers, and @code{nil} (which binds as @acronym{SQL}
+@code{NULL}).
+
+@code{mysql-execute} returns different values depending on the type of
+statement:
+
+@itemize @bullet
+@item
+For @acronym{DDL} statements (@samp{CREATE TABLE}, @samp{DROP TABLE},
+etc.) and @acronym{DML} statements (@samp{INSERT}, @samp{UPDATE},
+@samp{DELETE}), it returns the number of affected rows as an integer.
+For instance, an @samp{INSERT} statement will typically return @samp{1},
+whereas an @samp{UPDATE} statement may return zero or a higher number.
+
+@item
+For @samp{SELECT} statements (in the non-prepared path), the matching
+rows are returned as a list of lists, similar to @code{mysql-select}.
+However, for read queries you should prefer @code{mysql-select}, which
+provides the additional @code{full} return mode.
+@end itemize
+
+@lisp
+;; DDL returns 0
+(mysql-execute db "create table t (id int, name text)")
+    @result{} 0
+
+;; INSERT returns 1
+(mysql-execute db "insert into t values (1, 'foo')")
+    @result{} 1
+
+;; INSERT with bind parameters
+(mysql-execute db "insert into t values (?, ?)" '(2 "bar"))
+    @result{} 1
+
+;; UPDATE returns count of changed rows
+(mysql-execute db "update t set name = 'baz' where id <= 2")
+    @result{} 2
+
+;; DELETE returns count of deleted rows
+(mysql-execute db "delete from t where id = 1")
+    @result{} 1
+@end lisp
+
+Strings in this module are handled as @code{utf8mb4}, which means all
+text columns are encoded and decoded using UTF-8.  This correctly
+handles multi-byte characters including emoji.
+@end defun
+
+@node MySQL Queries
+@section Selecting Data
+@cindex selecting data, MySQL
+
+@defun mysql-select db query &optional values return-type
+Select data from @var{db} and return the result.  For instance:
+
+@lisp
+(mysql-select db "select * from foo where key = 2")
+    @result{} (("bar" 2))
+@end lisp
+
+As with @code{mysql-execute}, you can optionally pass in a list of
+values that will be bound to @samp{?} placeholders before executing the
+query:
+
+@lisp
+(mysql-select db "select * from foo where key = ?" '(2))
+    @result{} (("bar" 2))
+@end lisp
+
+This is usually more efficient and safer than the method used by the
+previous example.
+
+By default, this function returns a list of matching rows, where each
+row is a list of column values.  If @var{return-type} is @code{full},
+the names of the columns (as a list of strings) will be returned as the
+first element in the return value:
+
+@lisp
+(mysql-select db "select * from foo" nil 'full)
+    @result{} (("name" "key") ("bar" 2) ("baz" 3))
+@end lisp
+
+@noindent
+The first element @code{("name" "key")} is the list of column names,
+and the remaining elements are the data rows.
+
+If @var{return-type} is @code{set}, this function returns a
+@dfn{set object} (a cursor) that can be used to iterate over the result
+set one row at a time, without loading all rows into memory at once.
+This is especially useful for large result sets.  @xref{MySQL Set Objects}.
+
+@lisp
+(let ((set (mysql-select db "select * from foo" nil 'set)))
+  (unwind-protect
+      (while (mysql-more-p set)
+        (let ((row (mysql-next set)))
+          (when row (process-row row))))
+    (mysql-finalize set)))
+@end lisp
+
+If the result set is empty, the default mode returns @code{nil}, while
+the @code{full} mode returns a list containing only the column names:
+
+@lisp
+;; Default mode, empty table:
+(mysql-select db "select * from empty_table")
+    @result{} nil
+
+;; Full mode, empty table:
+(mysql-select db "select * from empty_table" nil 'full)
+    @result{} (("col1" "col2"))
+@end lisp
+@end defun
+
+@node MySQL Set Objects
+@section Set Objects (Lazy Cursor Iteration)
+@cindex set object, MySQL
+@cindex cursor, MySQL
+@cindex lazy iteration, MySQL
+
+  When @code{mysql-select} is called with @var{return-type} set to
+@code{set}, it returns a @dfn{set object} instead of a list of rows.
+A set object is a cursor that allows you to fetch rows one at a time
+using @code{mysql-next}, check whether more rows are available using
+@code{mysql-more-p}, and retrieve column names using
+@code{mysql-columns}.  This avoids loading the entire result set into
+memory, which is essential for large queries.
+
+  This interface is modeled after the built-in SQLite @code{set}
+support (@code{sqlite-next}, @code{sqlite-more-p},
+@code{sqlite-columns}, @code{sqlite-finalize}).
+
+@defun mysql-next set
+Return the next row from @var{set} as a list of column values.  Return
+@code{nil} when all rows have been fetched.
+
+@lisp
+(setq set (mysql-select db "select * from employees" nil 'set))
+(mysql-next set)
+    @result{} (1 "Alice" "Engineering" 95000.0)
+(mysql-next set)
+    @result{} (2 "Bob" "Product" 88000.0)
+(mysql-next set)
+    @result{} nil
+@end lisp
+@end defun
+
+@defun mysql-more-p set
+Return non-@code{nil} if there are more rows available in @var{set}.
+After @code{mysql-next} has returned @code{nil} (indicating that all
+rows have been consumed), this function also returns @code{nil}.
+
+@lisp
+(while (mysql-more-p set)
+  (let ((row (mysql-next set)))
+    (when row
+      (process-row row))))
+@end lisp
+@end defun
+
+@defun mysql-columns set
+Return the column names of @var{set} as a list of strings.  This can
+be called at any time while the set is open.
+
+@lisp
+(mysql-columns set)
+    @result{} ("id" "name" "dept" "salary")
+@end lisp
+@end defun
+
+@defun mysql-finalize set
+Free the resources held by @var{set}.  After this call, @var{set} can
+no longer be used with @code{mysql-next} or other set functions.
+
+It is not strictly necessary to call this function, because the
+resources will also be freed when @var{set} is garbage-collected.
+However, it is recommended to call it explicitly (typically in an
+@code{unwind-protect} form) to release the MySQL connection resources
+promptly.
+
+@lisp
+(let ((set (mysql-select db "select * from big_table" nil 'set)))
+  (unwind-protect
+      (while (mysql-more-p set)
+        (let ((row (mysql-next set)))
+          (when row (handle-row row))))
+    (mysql-finalize set)))
+@end lisp
+@end defun
+
+@node MySQL Batch Execution
+@section Executing Multiple Statements
+@cindex batch execution, MySQL
+
+@defun mysql-execute-batch db statements
+Execute the @acronym{SQL} @var{statements} on @var{db}.
+@var{statements} is a string containing one or more @acronym{SQL}
+statements separated by semicolons.  This function is useful when a
+Lisp program needs to execute multiple Data Definition Language
+(@acronym{DDL}) or Data Manipulation Language (@acronym{DML}) statements
+in one go.
+
+@lisp
+(mysql-execute-batch db
+  "create table t1 (id int);
+   create table t2 (id int);
+   insert into t1 values (1);")
+    @result{} t
+@end lisp
+
+All statements are sent to the server as a single multi-statement query.
+The function drains all result sets produced by the batch.  If any
+statement in the batch produces an error, an Emacs Lisp error is
+signaled.
+
+This function does not support bind parameters.  If you need
+parameterized execution, use @code{mysql-execute} for each statement
+individually.
+@end defun
+
+@node MySQL Transactions
+@section Transactions
+@cindex transactions, MySQL
+
+  The following functions provide explicit transaction control.
+Transactions are only effective on transactional storage engines such as
+InnoDB.
+
+@defun mysql-transaction db
+Start a transaction in @var{db} by executing @samp{START TRANSACTION}.
+While in a transaction, changes are not visible to other connections
+until the transaction is committed.
+@end defun
+
+@defun mysql-commit db
+Commit the current transaction in @var{db}.  All changes made since
+@code{mysql-transaction} was called become permanent.  Calling this
+function when there is no active transaction is harmless (it will not
+signal an error).
+@end defun
+
+@defun mysql-rollback db
+Roll back the current transaction in @var{db} and discard all changes
+made since @code{mysql-transaction} was called.
+@end defun
+
+A typical transaction pattern looks like this:
+
+@lisp
+(mysql-transaction db)
+(condition-case err
+    (progn
+      (mysql-execute db "insert into accounts values (?, ?)"
+                     '("Alice" 1000))
+      (mysql-execute db "insert into accounts values (?, ?)"
+                     '("Bob" 2000))
+      (mysql-commit db))
+  (error
+   (mysql-rollback db)
+   (signal (car err) (cdr err))))
+@end lisp
+
+@node MySQL Utility Functions
+@section Utility Functions
+@cindex utility functions, MySQL
+
+@defun mysql-escape-string db string
+Escape @var{string} for safe inclusion in an @acronym{SQL} statement on
+@var{db}.  The escaping takes the current connection character set into
+account.
+
+@lisp
+(mysql-escape-string db "it's a \"test\"")
+    @result{} "it\\'s a \\\"test\\\""
+@end lisp
+
+@strong{Note:} You should prefer using bind parameters (@samp{?}
+placeholders) with @code{mysql-execute} or @code{mysql-select} whenever
+possible.  Use @code{mysql-escape-string} only when you must
+dynamically construct @acronym{SQL} strings that cannot use
+placeholders (e.g., dynamic table or column names).
+@end defun
+
+@defun mysql-version
+Return a string denoting the version of the MySQL client library linked
+with this module.
+
+@lisp
+(mysql-version)
+    @result{} "8.0.36"
+@end lisp
+@end defun
+
+@node MySQL Type Mapping
+@section Type Mapping Between Emacs Lisp and MySQL
+@cindex type mapping, MySQL
+@cindex data types, MySQL
+
+  The @code{mysql-el} module automatically converts values between Emacs
+Lisp types and MySQL column types.  The exact mapping depends on
+whether you are @emph{writing} values (bind parameters) or
+@emph{reading} values (query results), and on whether the prepared-statement
+path is used.
+
+@subsection Writing: Emacs Lisp @expansion{} MySQL (Bind Parameters)
+
+When using bind parameters (@samp{?} placeholders) with
+@code{mysql-execute} or @code{mysql-select}, the following type mappings
+are used:
+
+@multitable @columnfractions .35 .35 .3
+@headitem Emacs Lisp type @tab MySQL bind type @tab Notes
+@item @code{string}
+@tab @code{MYSQL_TYPE_STRING}
+@tab Sent as UTF-8 encoded text.
+@item @code{integer}
+@tab @code{MYSQL_TYPE_LONGLONG}
+@tab 64-bit signed integer.
+@item @code{float}
+@tab @code{MYSQL_TYPE_DOUBLE}
+@tab 64-bit IEEE 754 double.
+@item @code{nil}
+@tab @code{MYSQL_TYPE_NULL}
+@tab Binds as SQL @code{NULL}.
+@end multitable
+
+@noindent
+MySQL performs implicit type coercion on the server side, so you can,
+for example, bind an Emacs integer to a @code{DECIMAL} column and it
+will be stored correctly.
+
+@subsection Reading: MySQL @expansion{} Emacs Lisp (Non-Prepared Path)
+
+When fetching results via the non-prepared path (i.e., @code{mysql-select}
+or @code{mysql-execute} @emph{without} bind parameters), the module
+inspects the MySQL column type metadata and converts each value to the
+most appropriate Emacs Lisp type.
+
+@subsubsection Integer Types @result{} Emacs @code{integer}
+
+The following MySQL column types are returned as Emacs Lisp integers:
+
+@multitable @columnfractions .25 .25 .5
+@headitem MySQL type @tab SQL declaration @tab Range / Notes
+@item @code{MYSQL_TYPE_TINY}
+@tab @code{TINYINT}
+@tab @minus{}128 to 127 (signed), 0 to 255 (unsigned).  @code{BOOLEAN}/@code{BOOL} is a synonym for @code{TINYINT(1)}.
+@item @code{MYSQL_TYPE_SHORT}
+@tab @code{SMALLINT}
+@tab @minus{}32768 to 32767 (signed).
+@item @code{MYSQL_TYPE_INT24}
+@tab @code{MEDIUMINT}
+@tab @minus{}8388608 to 8388607 (signed).
+@item @code{MYSQL_TYPE_LONG}
+@tab @code{INT}
+@tab @minus{}2147483648 to 2147483647 (signed).
+@item @code{MYSQL_TYPE_LONGLONG}
+@tab @code{BIGINT}
+@tab 64-bit signed integer.  Very large unsigned @code{BIGINT} values may overflow Emacs fixnum range; consider using strings for such columns.
+@item @code{MYSQL_TYPE_YEAR}
+@tab @code{YEAR}
+@tab 4-digit year (e.g., 2026).
+@end multitable
+
+@lisp
+(mysql-execute db "CREATE TABLE int_demo (
+  a TINYINT, b SMALLINT, c MEDIUMINT,
+  d INT, e BIGINT, f YEAR, g BOOLEAN)")
+(mysql-execute db "INSERT INTO int_demo VALUES
+  (-1, 300, 100000, 2000000, 9000000000, 2026, 1)")
+(mysql-select db "SELECT * FROM int_demo")
+    @result{} ((-1 300 100000 2000000 9000000000 2026 1))
+@end lisp
+
+@subsubsection Floating-Point and Decimal Types @result{} Emacs @code{float}
+
+The following MySQL column types are returned as Emacs Lisp
+floating-point numbers:
+
+@multitable @columnfractions .30 .25 .45
+@headitem MySQL type @tab SQL declaration @tab Notes
+@item @code{MYSQL_TYPE_FLOAT}
+@tab @code{FLOAT}
+@tab Single-precision (32-bit) IEEE 754.
+@item @code{MYSQL_TYPE_DOUBLE}
+@tab @code{DOUBLE}
+@tab Double-precision (64-bit) IEEE 754.
+@item @code{MYSQL_TYPE_DECIMAL}
+@tab @code{DECIMAL} (legacy)
+@tab Converted via @code{strtod}; may lose precision for very high-precision values.
+@item @code{MYSQL_TYPE_NEWDECIMAL}
+@tab @code{DECIMAL}/@code{NUMERIC}
+@tab The modern decimal type.  Also converted to Emacs float; precision beyond ~15 significant digits may be lost.
+@end multitable
+
+@lisp
+(mysql-execute db "CREATE TABLE float_demo (
+  a FLOAT, b DOUBLE, c DECIMAL(10,2), d DECIMAL(30,15))")
+(mysql-execute db "INSERT INTO float_demo VALUES
+  (3.14, 2.718281828, 12345.67, 123456789.123456789012345)")
+(mysql-select db "SELECT * FROM float_demo")
+    @result{} ((3.14 2.718281828 12345.67 1.2345678912345679e+08))
+@end lisp
+
+@noindent
+@strong{Precision note:} If you need exact decimal arithmetic with more
+than 15 significant digits, use the prepared-statement path (which
+returns strings) and parse the values yourself.
+
+@subsubsection String Types @result{} Emacs @code{string}
+
+All other MySQL column types are returned as Emacs Lisp strings.  This
+includes:
+
+@multitable @columnfractions .35 .65
+@headitem Category @tab MySQL types
+@item Character strings
+@tab @code{CHAR}, @code{VARCHAR}, @code{TINYTEXT}, @code{TEXT}, @code{MEDIUMTEXT}, @code{LONGTEXT}
+@item Binary strings
+@tab @code{BINARY}, @code{VARBINARY}, @code{TINYBLOB}, @code{BLOB}, @code{MEDIUMBLOB}, @code{LONGBLOB}
+@item Date and time
+@tab @code{DATE}, @code{TIME}, @code{DATETIME}, @code{TIMESTAMP}
+@item Enumeration
+@tab @code{ENUM}, @code{SET}
+@item Structured
+@tab @code{JSON}
+@item Bit
+@tab @code{BIT}
+@item Spatial
+@tab @code{GEOMETRY}, @code{POINT}, @code{LINESTRING}, @code{POLYGON}, etc.
+@end multitable
+
+@lisp
+(mysql-execute db "CREATE TABLE str_demo (
+  a VARCHAR(50), b DATE, c DATETIME(6),
+  d JSON, e ENUM('x','y','z'))")
+(mysql-execute db "INSERT INTO str_demo VALUES
+  ('hello', '2026-03-26', '2026-03-26 12:30:00.123456',
+   '@{"key":"val"@}', 'y')")
+(mysql-select db "SELECT * FROM str_demo")
+    @result{} (("hello" "2026-03-26" "2026-03-26 12:30:00.123456"
+        "@{\"key\": \"val\"@}" "y"))
+@end lisp
+
+@subsubsection NULL @result{} Emacs @code{nil}
+
+A @code{NULL} value in any column, regardless of the column type, is
+always returned as Emacs Lisp @code{nil}.
+
+@lisp
+(mysql-select db "SELECT NULL, CAST(NULL AS SIGNED), CAST(NULL AS CHAR)")
+    @result{} ((nil nil nil))
+@end lisp
+
+@subsection Reading: Prepared-Statement Path
+
+@strong{Important:} When bind parameters are supplied (i.e., the
+@var{values} argument to @code{mysql-select} or @code{mysql-execute} is
+non-@code{nil}), all non-@code{NULL} result values are returned as
+@strong{strings}, regardless of the MySQL column type.  This is because
+the MySQL C prepared-statement @acronym{API} uses a uniform string
+buffer for fetching results.
+
+@lisp
+;; Non-prepared: integers and floats are native types.
+(mysql-select db "SELECT 42, 3.14")
+    @result{} ((42 3.14))
+
+;; Prepared: all values come back as strings.
+(mysql-select db "SELECT id, salary FROM employees WHERE id = ?" '(1))
+    @result{} (("1" "95000"))
+@end lisp
+
+@noindent
+If you need native Emacs types from a prepared query, convert the
+string results yourself:
+
+@lisp
+(let ((row (car (mysql-select db "SELECT id, salary FROM employees
+                                  WHERE id = ?" '(1)))))
+  (list (string-to-number (nth 0 row))    ; integer
+        (string-to-number (nth 1 row))))   ; float
+@end lisp
+
+@subsection Complete Type Reference
+
+The following table is an exhaustive reference of every MySQL column type
+and its corresponding Emacs Lisp type, for both query paths.
+
+@multitable @columnfractions .30 .30 .40
+@headitem MySQL column type @tab Non-prepared path @tab Prepared path
+@item @code{TINYINT} / @code{BOOLEAN}
+@tab @code{integer}
+@tab @code{string}
+@item @code{SMALLINT}
+@tab @code{integer}
+@tab @code{string}
+@item @code{MEDIUMINT}
+@tab @code{integer}
+@tab @code{string}
+@item @code{INT}
+@tab @code{integer}
+@tab @code{string}
+@item @code{BIGINT}
+@tab @code{integer}
+@tab @code{string}
+@item @code{YEAR}
+@tab @code{integer}
+@tab @code{string}
+@item @code{FLOAT}
+@tab @code{float}
+@tab @code{string}
+@item @code{DOUBLE}
+@tab @code{float}
+@tab @code{string}
+@item @code{DECIMAL} / @code{NUMERIC}
+@tab @code{float}
+@tab @code{string}
+@item @code{CHAR} / @code{VARCHAR}
+@tab @code{string}
+@tab @code{string}
+@item @code{TINYTEXT} / @code{TEXT} / @code{MEDIUMTEXT} / @code{LONGTEXT}
+@tab @code{string}
+@tab @code{string}
+@item @code{BINARY} / @code{VARBINARY}
+@tab @code{string}
+@tab @code{string}
+@item @code{TINYBLOB} / @code{BLOB} / @code{MEDIUMBLOB} / @code{LONGBLOB}
+@tab @code{string}
+@tab @code{string}
+@item @code{DATE}
+@tab @code{string}
+@tab @code{string}
+@item @code{TIME}
+@tab @code{string}
+@tab @code{string}
+@item @code{DATETIME}
+@tab @code{string}
+@tab @code{string}
+@item @code{TIMESTAMP}
+@tab @code{string}
+@tab @code{string}
+@item @code{ENUM}
+@tab @code{string}
+@tab @code{string}
+@item @code{SET}
+@tab @code{string}
+@tab @code{string}
+@item @code{JSON}
+@tab @code{string}
+@tab @code{string}
+@item @code{BIT}
+@tab @code{string}
+@tab @code{string}
+@item @code{GEOMETRY} / spatial types
+@tab @code{string}
+@tab @code{string}
+@item Any type with @code{NULL} value
+@tab @code{nil}
+@tab @code{nil}
+@end multitable
+
+@node MySQL Complete Example
+@section A Complete Example
+@cindex example, MySQL
+
+  The following example demonstrates how to use the MySQL module to
+manage a simple employee table.  It exercises all the core @acronym{API}
+functions in sequence: connecting, creating a table, inserting data
+(with and without bind parameters), querying, updating, using
+transactions, batch execution, and closing the connection.
+
+@lisp
+;; Load the module.
+(module-load "/path/to/mysql-el.so")
+
+;; Connect to a MySQL server.
+(setq db (mysql-open "127.0.0.1" "root" "" "mydb" 3306))
+
+;; Create a table.
+(mysql-execute db
+  "CREATE TABLE employees (
+     id     INT PRIMARY KEY AUTO_INCREMENT,
+     name   VARCHAR(100) NOT NULL,
+     dept   VARCHAR(50),
+     salary DOUBLE
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+
+;; Insert rows using plain SQL.
+(mysql-execute db
+  "INSERT INTO employees (name, dept, salary)
+   VALUES ('Alice', 'Engineering', 95000)")
+    @result{} 1
+
+;; Insert a row using bind parameters (safer, prevents injection).
+(mysql-execute db
+  "INSERT INTO employees (name, dept, salary) VALUES (?, ?, ?)"
+  '("Bob" "Product" 88000.0))
+    @result{} 1
+
+;; Query all employees.
+(mysql-select db
+  "SELECT name, dept, salary FROM employees ORDER BY id")
+    @result{} (("Alice" "Engineering" 95000.0)
+        ("Bob" "Product" 88000.0))
+
+;; Query with column names (full mode).
+(mysql-select db
+  "SELECT name, salary FROM employees" nil 'full)
+    @result{} (("name" "salary")
+        ("Alice" 95000.0)
+        ("Bob" 88000.0))
+
+;; Conditional query with bind parameters.
+(mysql-select db
+  "SELECT name FROM employees WHERE dept = ?"
+  '("Engineering"))
+    @result{} (("Alice"))
+
+;; Update rows; returns number of changed rows.
+(mysql-execute db
+  "UPDATE employees SET salary = salary * 1.1
+   WHERE dept = 'Engineering'")
+    @result{} 1
+
+;; Use a transaction to insert multiple rows atomically.
+(mysql-transaction db)
+(mysql-execute db
+  "INSERT INTO employees (name, dept, salary) VALUES (?, ?, ?)"
+  '("Carol" "Engineering" 92000.0))
+(mysql-execute db
+  "INSERT INTO employees (name, dept, salary) VALUES (?, ?, ?)"
+  '("Dave" "Finance" 78000.0))
+(mysql-commit db)
+
+;; Batch-execute multiple statements.
+(mysql-execute-batch db
+  "INSERT INTO employees (name, dept, salary)
+     VALUES ('Eve', 'HR', 70000);
+   INSERT INTO employees (name, dept, salary)
+     VALUES ('Frank', 'HR', 72000);")
+    @result{} t
+
+;; Iterate over a large result set lazily with a set object.
+(let ((set (mysql-select db
+              "SELECT name, salary FROM employees ORDER BY id"
+              nil 'set)))
+  (unwind-protect
+      (progn
+        ;; Get column names.
+        (mysql-columns set)
+            @result{} ("name" "salary")
+        ;; Fetch rows one by one.
+        (while (mysql-more-p set)
+          (let ((row (mysql-next set)))
+            (when row
+              (message "Employee: %s, salary: %s"
+                       (nth 0 row) (nth 1 row))))))
+    (mysql-finalize set)))
+
+;; Clean up and close.
+(mysql-execute db "DROP TABLE employees")
+(mysql-close db)
+@end lisp
+
+@bye
