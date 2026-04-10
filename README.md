@@ -231,7 +231,7 @@ Return the MySQL client library version string, e.g. `"8.0.36"`.
 ### mysql-open
 
 ```
-(mysql-open HOST USER PASSWORD &optional DATABASE PORT) → DB
+(mysql-open HOST USER PASSWORD &optional DATABASE PORT TIMEOUT) → DB
 ```
 
 Open a MySQL connection and return a database handle object.
@@ -243,11 +243,13 @@ Open a MySQL connection and return a database handle object.
 | PASSWORD | string | Password; pass `""` for no password |
 | DATABASE | string \| nil | Optional, default database name |
 | PORT | integer \| nil | Optional, defaults to 3306 |
+| TIMEOUT | integer \| nil | Optional, read/write/connect timeout in seconds (0 or nil = no timeout) |
 
 **Features:**
 - The connection charset is automatically set to `utf8mb4`
 - The connection is opened with `CLIENT_MULTI_STATEMENTS`, enabling `mysql-execute-batch`
 - When the connection object is garbage collected, `mysql_close` is called automatically
+- When TIMEOUT is set, `MYSQL_OPT_READ_TIMEOUT`, `MYSQL_OPT_WRITE_TIMEOUT`, and `MYSQL_OPT_CONNECT_TIMEOUT` are configured, preventing indefinite blocking when the server is unresponsive
 
 ```elisp
 ;; Minimal usage (3 required parameters)
@@ -255,6 +257,9 @@ Open a MySQL connection and return a database handle object.
 
 ;; Full usage
 (setq db (mysql-open "127.0.0.1" "root" "mypassword" "mydb" 3306))
+
+;; With 30-second timeout (prevents Emacs from hanging)
+(setq db (mysql-open "127.0.0.1" "root" "mypassword" "mydb" 3306 30))
 ```
 
 ---
@@ -550,6 +555,142 @@ Escape a string for safe use in MySQL queries, preventing SQL injection. The esc
 ```
 
 > **Best practice:** Prefer using the `?` bound parameters of `mysql-execute` / `mysql-select`. Only use this function when dynamic SQL construction is unavoidable.
+
+---
+
+## Asynchronous (Non-blocking) API
+
+Requires MySQL 8.0.16+ `libmysqlclient` which provides `_nonblocking` functions. These functions return immediately without blocking Emacs, allowing the editor to remain responsive during long-running queries.
+
+### Overview
+
+A typical async query involves three phases:
+
+1. **Query phase**: `mysql-query-start` / `mysql-query-continue` — send the SQL to the server
+2. **Store phase**: `mysql-store-result-start` / `mysql-store-result-continue` — fetch the result set into client memory
+3. **Result phase**: `mysql-async-result` — convert the stored result to Elisp (no I/O, instant)
+
+```elisp
+;; Phase 1: start query (non-blocking)
+(let ((status (mysql-query-start db "SELECT * FROM users")))
+  (while (eq status 'not-ready)
+    (sit-for 0.02)  ; yield to Emacs event loop
+    (setq status (mysql-query-continue db)))
+  ;; status is now 'complete or 'error
+
+  ;; Phase 2: fetch result set (non-blocking)
+  (let ((pair (mysql-store-result-start db)))
+    (while (eq (car pair) 'not-ready)
+      (sit-for 0.02)
+      (setq pair (mysql-store-result-continue db)))
+    ;; (car pair) is 'complete, (cdr pair) is the result pointer
+
+    ;; Phase 3: convert to Elisp list (instant, no I/O)
+    (let ((result (mysql-async-result db (cdr pair) t)))
+      ;; result = (("col1" "col2") (val1 val2) ...)
+      result)))
+```
+
+### mysql-query-start
+
+```
+(mysql-query-start DB SQL) → symbol
+```
+
+Begin an asynchronous query. Returns immediately with one of:
+- `'complete` — the query finished instantly (fast path)
+- `'not-ready` — still in progress, call `mysql-query-continue` to poll
+- `'error` — the query failed (an Emacs error is also signaled)
+
+---
+
+### mysql-query-continue
+
+```
+(mysql-query-continue DB) → symbol
+```
+
+Continue a previously started asynchronous query. Returns `'complete`, `'not-ready`, or `'error`. Call repeatedly (e.g. on a timer) until the status is no longer `'not-ready`.
+
+---
+
+### mysql-store-result-start
+
+```
+(mysql-store-result-start DB) → (STATUS . RESULT-PTR)
+```
+
+Begin asynchronously fetching the result set into client memory. Returns a cons cell:
+- `STATUS` — `'complete`, `'not-ready`, or `'error`
+- `RESULT-PTR` — when complete, a user-ptr to the `MYSQL_RES` (or `nil` for non-SELECT queries)
+
+---
+
+### mysql-store-result-continue
+
+```
+(mysql-store-result-continue DB) → (STATUS . RESULT-PTR)
+```
+
+Continue fetching the result set. Same return format as `mysql-store-result-start`.
+
+---
+
+### mysql-async-result
+
+```
+(mysql-async-result DB RESULT-PTR &optional FULL) → LIST
+```
+
+Convert an already-stored `MYSQL_RES` into an Emacs list. **This does not perform any I/O** — the data is already in client memory, so this call is instant.
+
+| Parameter | Description |
+|-----------|-------------|
+| DB | Database connection handle |
+| RESULT-PTR | The result pointer from `mysql-store-result-start/continue` |
+| FULL | If non-nil, include column names as the first element (like `mysql-select` with `'full`) |
+
+After this call, the result set is freed and `RESULT-PTR` is invalidated.
+
+```elisp
+;; Without FULL:
+(mysql-async-result db res-ptr nil)
+;; => ((1 "Alice") (2 "Bob"))
+
+;; With FULL:
+(mysql-async-result db res-ptr t)
+;; => (("id" "name") (1 "Alice") (2 "Bob"))
+```
+
+---
+
+### mysql-async-affected-rows
+
+```
+(mysql-async-affected-rows DB) → INTEGER
+```
+
+After an async non-SELECT query completes, return the number of affected rows.
+
+---
+
+### mysql-async-field-count
+
+```
+(mysql-async-field-count DB) → INTEGER
+```
+
+After an async query completes, return the field count. Returns 0 for non-SELECT queries (INSERT/UPDATE/DELETE/DDL), and a positive number for SELECT queries.
+
+Use this to distinguish SELECT from DML after an async query:
+
+```elisp
+(if (> (mysql-async-field-count db) 0)
+    ;; SELECT — fetch result with mysql-async-result
+    ...
+  ;; DML — get affected rows with mysql-async-affected-rows
+  ...)
+```
 
 ---
 

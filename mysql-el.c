@@ -165,7 +165,7 @@ static emacs_value
 Fmysql_open (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
              void *data)
 {
-  /* (mysql-open HOST USER PASSWORD &optional DATABASE PORT) */
+  /* (mysql-open HOST USER PASSWORD &optional DATABASE PORT TIMEOUT) */
   char *host = extract_string (env, args[0]);
   if (!host) return env->intern (env, "nil");
   char *user = extract_string (env, args[1]);
@@ -175,11 +175,14 @@ Fmysql_open (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
 
   char *database = NULL;
   unsigned int port = 0;
+  unsigned int timeout = 0;
 
   if (nargs > 3 && env->is_not_nil (env, args[3]))
     database = extract_string (env, args[3]);
   if (nargs > 4 && env->is_not_nil (env, args[4]))
     port = (unsigned int) env->extract_integer (env, args[4]);
+  if (nargs > 5 && env->is_not_nil (env, args[5]))
+    timeout = (unsigned int) env->extract_integer (env, args[5]);
 
   MYSQL *conn = mysql_init (NULL);
   if (!conn)
@@ -187,6 +190,16 @@ Fmysql_open (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
       signal_error (env, "mysql_init failed");
       free (host); free (user); free (password); free (database);
       return env->intern (env, "nil");
+    }
+
+  /* Set read/write timeouts before connecting.
+     This prevents Emacs from hanging indefinitely when the server
+     is unresponsive (e.g. stopped in gdb, network partition).  */
+  if (timeout > 0)
+    {
+      mysql_options (conn, MYSQL_OPT_READ_TIMEOUT, &timeout);
+      mysql_options (conn, MYSQL_OPT_WRITE_TIMEOUT, &timeout);
+      mysql_options (conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
     }
 
   if (!mysql_real_connect (conn, host, user, password, database, port,
@@ -1202,6 +1215,230 @@ Fmysql_escape_string (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
 }
 
 /* ------------------------------------------------------------------ */
+/*  Asynchronous (non-blocking) query API                             */
+/*  Uses mysql_real_query_nonblocking / mysql_store_result_nonblocking */
+/*  so that Emacs can remain responsive during long queries.          */
+/* ------------------------------------------------------------------ */
+
+/* Include the header that defines net_async_status.  */
+#include <mysql/plugin_auth_common.h>
+
+/* (mysql-query-start DB SQL) → symbol
+   Begin an asynchronous query.  Returns:
+     'complete  — query already finished (fast path)
+     'not-ready — still in progress, call mysql-query-continue
+     'error     — query failed  */
+static emacs_value
+Fmysql_query_start (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
+                    void *data)
+{
+  MYSQL *conn = env->get_user_ptr (env, args[0]);
+  if (!conn)
+    {
+      signal_error (env, "Invalid or closed database object");
+      return env->intern (env, "nil");
+    }
+
+  char *sql = extract_string (env, args[1]);
+  if (!sql) return env->intern (env, "nil");
+
+  enum net_async_status status =
+    mysql_real_query_nonblocking (conn, sql, strlen (sql));
+  free (sql);
+
+  switch (status)
+    {
+    case NET_ASYNC_COMPLETE:
+      return env->intern (env, "complete");
+    case NET_ASYNC_NOT_READY:
+      return env->intern (env, "not-ready");
+    default:
+      signal_mysql_error (env, "mysql_real_query_nonblocking", conn);
+      return env->intern (env, "error");
+    }
+}
+
+/* (mysql-query-continue DB) → symbol
+   Continue a previously started asynchronous query.
+   Returns 'complete, 'not-ready, or 'error.  */
+static emacs_value
+Fmysql_query_continue (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
+                       void *data)
+{
+  MYSQL *conn = env->get_user_ptr (env, args[0]);
+  if (!conn)
+    {
+      signal_error (env, "Invalid or closed database object");
+      return env->intern (env, "nil");
+    }
+
+  /* Re-call with the same args (NULL, 0) — the library keeps state
+     internally on the MYSQL handle.  */
+  enum net_async_status status =
+    mysql_real_query_nonblocking (conn, NULL, 0);
+
+  switch (status)
+    {
+    case NET_ASYNC_COMPLETE:
+      return env->intern (env, "complete");
+    case NET_ASYNC_NOT_READY:
+      return env->intern (env, "not-ready");
+    default:
+      signal_mysql_error (env, "mysql_real_query_nonblocking", conn);
+      return env->intern (env, "error");
+    }
+}
+
+/* (mysql-store-result-start DB) → (STATUS . RESULT-OR-NIL)
+   Begin asynchronously fetching the result set into client memory.
+   STATUS is 'complete, 'not-ready, or 'error.
+   When STATUS is 'complete, cdr is the result-set user-ptr (or nil
+   if the query was not a SELECT).  */
+static emacs_value
+Fmysql_store_result_start (emacs_env *env, ptrdiff_t nargs,
+                           emacs_value args[], void *data)
+{
+  MYSQL *conn = env->get_user_ptr (env, args[0]);
+  if (!conn)
+    {
+      signal_error (env, "Invalid or closed database object");
+      return env->intern (env, "nil");
+    }
+
+  MYSQL_RES *res = NULL;
+  enum net_async_status status =
+    mysql_store_result_nonblocking (conn, &res);
+
+  emacs_value Qcons = env->intern (env, "cons");
+  emacs_value status_sym;
+  emacs_value result_val;
+
+  switch (status)
+    {
+    case NET_ASYNC_COMPLETE:
+      status_sym = env->intern (env, "complete");
+      if (res)
+        result_val = env->make_user_ptr (env, NULL, res);
+      else
+        result_val = env->intern (env, "nil");
+      break;
+    case NET_ASYNC_NOT_READY:
+      status_sym = env->intern (env, "not-ready");
+      result_val = env->intern (env, "nil");
+      break;
+    default:
+      signal_mysql_error (env, "mysql_store_result_nonblocking", conn);
+      return env->intern (env, "nil");
+    }
+
+  emacs_value cons_args[] = { status_sym, result_val };
+  return env->funcall (env, Qcons, 2, cons_args);
+}
+
+/* (mysql-store-result-continue DB) → (STATUS . RESULT-OR-NIL)
+   Continue fetching the result set.  Same return as -start.  */
+static emacs_value
+Fmysql_store_result_continue (emacs_env *env, ptrdiff_t nargs,
+                              emacs_value args[], void *data)
+{
+  /* Identical to -start: the nonblocking API uses the MYSQL handle
+     to track state internally.  */
+  return Fmysql_store_result_start (env, nargs, args, data);
+}
+
+/* (mysql-async-result DB RESULT-PTR FULL) → LIST
+   Synchronously convert a MYSQL_RES* (already fully stored in client
+   memory) to an Emacs list.  FULL non-nil means include column names
+   as the first element.  This does NOT block on I/O.  */
+static emacs_value
+Fmysql_async_result (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
+                     void *data)
+{
+  MYSQL *conn = env->get_user_ptr (env, args[0]);
+  if (!conn)
+    {
+      signal_error (env, "Invalid or closed database object");
+      return env->intern (env, "nil");
+    }
+
+  MYSQL_RES *res = env->get_user_ptr (env, args[1]);
+  if (!res)
+    {
+      /* Not a SELECT — return affected row count.  */
+      if (mysql_field_count (conn) == 0)
+        {
+          my_ulonglong affected = mysql_affected_rows (conn);
+          return env->make_integer (env, (intmax_t) affected);
+        }
+      signal_mysql_error (env, "No result set", conn);
+      return env->intern (env, "nil");
+    }
+
+  bool full_mode = (nargs > 2 && env->is_not_nil (env, args[2]));
+
+  emacs_value Qcons = env->intern (env, "cons");
+  emacs_value Qnreverse = env->intern (env, "nreverse");
+  emacs_value rows = env->intern (env, "nil");
+  MYSQL_ROW row;
+
+  while ((row = mysql_fetch_row (res)))
+    {
+      emacs_value r = row_to_list (env, res, row);
+      emacs_value ra[] = { r, rows };
+      rows = env->funcall (env, Qcons, 2, ra);
+    }
+
+  emacs_value data_list = env->funcall (env, Qnreverse, 1, &rows);
+
+  emacs_value retval;
+  if (full_mode)
+    {
+      emacs_value col_list = column_names (env, res);
+      emacs_value fa[] = { col_list, data_list };
+      retval = env->funcall (env, Qcons, 2, fa);
+    }
+  else
+    retval = data_list;
+
+  mysql_free_result (res);
+  /* Null out the user-ptr so it won't be double-freed.  */
+  env->set_user_ptr (env, args[1], NULL);
+  return retval;
+}
+
+/* (mysql-async-affected-rows DB) → INTEGER
+   After an async non-SELECT query completes, return the affected row count.  */
+static emacs_value
+Fmysql_async_affected_rows (emacs_env *env, ptrdiff_t nargs,
+                            emacs_value args[], void *data)
+{
+  MYSQL *conn = env->get_user_ptr (env, args[0]);
+  if (!conn)
+    {
+      signal_error (env, "Invalid or closed database object");
+      return env->intern (env, "nil");
+    }
+  my_ulonglong affected = mysql_affected_rows (conn);
+  return env->make_integer (env, (intmax_t) affected);
+}
+
+/* (mysql-async-field-count DB) → INTEGER
+   After an async query completes, return field_count.
+   0 means the query was not a SELECT.  */
+static emacs_value
+Fmysql_async_field_count (emacs_env *env, ptrdiff_t nargs,
+                          emacs_value args[], void *data)
+{
+  MYSQL *conn = env->get_user_ptr (env, args[0]);
+  if (!conn)
+    {
+      signal_error (env, "Invalid or closed database object");
+      return env->intern (env, "nil");
+    }
+  return env->make_integer (env, (intmax_t) mysql_field_count (conn));
+}
+
+/* ------------------------------------------------------------------ */
 /*  Module initialisation                                             */
 /* ------------------------------------------------------------------ */
 
@@ -1212,9 +1449,10 @@ emacs_module_init (struct emacs_runtime *ert)
 
   /* mysql-open: 3 required (host user password), 2 optional (database port) */
   bind_function (env, "mysql-open",
-                 env->make_function (env, 3, 5, Fmysql_open,
+                 env->make_function (env, 3, 6, Fmysql_open,
     "Open a MySQL connection.\n"
-    "(mysql-open HOST USER PASSWORD &optional DATABASE PORT)\n"
+    "(mysql-open HOST USER PASSWORD &optional DATABASE PORT TIMEOUT)\n"
+    "TIMEOUT is the read/write/connect timeout in seconds (0 or nil = no timeout).\n"
     "Return a database handle object.",
                                      NULL));
 
@@ -1314,6 +1552,55 @@ emacs_module_init (struct emacs_runtime *ert)
                  env->make_function (env, 2, 2, Fmysql_escape_string,
     "Escape STRING for safe use in SQL on DB.\n"
     "(mysql-escape-string DB STRING)",
+                                     NULL));
+
+  /* --- Asynchronous (non-blocking) API --- */
+
+  bind_function (env, "mysql-query-start",
+                 env->make_function (env, 2, 2, Fmysql_query_start,
+    "Begin an asynchronous query on DB.\n"
+    "(mysql-query-start DB SQL)\n"
+    "Return 'complete, 'not-ready, or 'error.",
+                                     NULL));
+
+  bind_function (env, "mysql-query-continue",
+                 env->make_function (env, 1, 1, Fmysql_query_continue,
+    "Continue a previously started asynchronous query on DB.\n"
+    "(mysql-query-continue DB)\n"
+    "Return 'complete, 'not-ready, or 'error.",
+                                     NULL));
+
+  bind_function (env, "mysql-store-result-start",
+                 env->make_function (env, 1, 1, Fmysql_store_result_start,
+    "Begin async fetching of result set into client memory.\n"
+    "(mysql-store-result-start DB)\n"
+    "Return (STATUS . RESULT-OR-NIL).",
+                                     NULL));
+
+  bind_function (env, "mysql-store-result-continue",
+                 env->make_function (env, 1, 1, Fmysql_store_result_continue,
+    "Continue async fetching of result set.\n"
+    "(mysql-store-result-continue DB)\n"
+    "Return (STATUS . RESULT-OR-NIL).",
+                                     NULL));
+
+  bind_function (env, "mysql-async-result",
+                 env->make_function (env, 2, 3, Fmysql_async_result,
+    "Convert an async MYSQL_RES to an Emacs list (no I/O).\n"
+    "(mysql-async-result DB RESULT-PTR &optional FULL)\n"
+    "FULL non-nil: include column names as first element.",
+                                     NULL));
+
+  bind_function (env, "mysql-async-affected-rows",
+                 env->make_function (env, 1, 1, Fmysql_async_affected_rows,
+    "Return affected row count after async non-SELECT query.\n"
+    "(mysql-async-affected-rows DB)",
+                                     NULL));
+
+  bind_function (env, "mysql-async-field-count",
+                 env->make_function (env, 1, 1, Fmysql_async_field_count,
+    "Return field_count after async query (0 = not a SELECT).\n"
+    "(mysql-async-field-count DB)",
                                      NULL));
 
   provide (env, "mysql-el");

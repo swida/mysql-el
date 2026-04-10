@@ -1323,4 +1323,160 @@
         (should (equal (car (nth 1 rows)) four-byte-str))))
     (mysql-execute db "DROP TABLE test_charset_4b")))
 
+;; ================================================================
+;; 30.  Async API: mysql-query-start / mysql-query-continue
+;; ================================================================
+
+(ert-deftest mysql-async-query-select-test ()
+  "Async query + store-result should return the same data as sync mysql-select."
+  (with-test-mysql-db db
+    (mysql-execute db "DROP TABLE IF EXISTS test_async")
+    (mysql-execute db "CREATE TABLE test_async (id INT, name TEXT)")
+    (mysql-execute db "INSERT INTO test_async VALUES (1, 'alpha')")
+    (mysql-execute db "INSERT INTO test_async VALUES (2, 'beta')")
+    (mysql-execute db "INSERT INTO test_async VALUES (3, 'gamma')")
+    ;; Phase 1: query
+    (let ((status (mysql-query-start db "SELECT * FROM test_async ORDER BY id")))
+      ;; Poll until complete
+      (while (eq status 'not-ready)
+        (setq status (mysql-query-continue db)))
+      (should (eq status 'complete)))
+    ;; Phase 2: store result
+    (let (result-pair res-ptr)
+      (setq result-pair (mysql-store-result-start db))
+      (while (eq (car result-pair) 'not-ready)
+        (setq result-pair (mysql-store-result-continue db)))
+      (should (eq (car result-pair) 'complete))
+      (setq res-ptr (cdr result-pair))
+      ;; res-ptr should be non-nil for a SELECT
+      (should res-ptr)
+      ;; Phase 3: extract result (with column names)
+      (let ((result (mysql-async-result db res-ptr t)))
+        ;; Column names
+        (should (equal (car result) '("id" "name")))
+        ;; 3 rows
+        (should (= (length (cdr result)) 3))
+        ;; First row
+        (should (= (nth 0 (nth 1 result)) 1))
+        (should (equal (nth 1 (nth 1 result)) "alpha"))
+        ;; Third row
+        (should (= (nth 0 (nth 3 result)) 3))
+        (should (equal (nth 1 (nth 3 result)) "gamma"))))
+    (mysql-execute db "DROP TABLE test_async")))
+
+(ert-deftest mysql-async-query-dml-test ()
+  "Async query for INSERT/UPDATE/DELETE should report affected rows."
+  (with-test-mysql-db db
+    (mysql-execute db "DROP TABLE IF EXISTS test_async_dml")
+    (mysql-execute db "CREATE TABLE test_async_dml (id INT, val TEXT)")
+    (mysql-execute db "INSERT INTO test_async_dml VALUES (1, 'a')")
+    (mysql-execute db "INSERT INTO test_async_dml VALUES (2, 'b')")
+    (mysql-execute db "INSERT INTO test_async_dml VALUES (3, 'c')")
+    ;; Async DELETE
+    (let ((status (mysql-query-start db "DELETE FROM test_async_dml WHERE id > 1")))
+      (while (eq status 'not-ready)
+        (setq status (mysql-query-continue db)))
+      (should (eq status 'complete)))
+    ;; Store result (for DML, result is nil)
+    (let ((result-pair (mysql-store-result-start db)))
+      (while (eq (car result-pair) 'not-ready)
+        (setq result-pair (mysql-store-result-continue db)))
+      (should (eq (car result-pair) 'complete))
+      ;; For DML, cdr should be nil
+      (should-not (cdr result-pair)))
+    ;; Check affected rows
+    (should (= (mysql-async-affected-rows db) 2))
+    ;; field-count should be 0 (not a SELECT)
+    (should (= (mysql-async-field-count db) 0))
+    ;; Verify with sync select
+    (let ((rows (mysql-select db "SELECT * FROM test_async_dml")))
+      (should (= (length rows) 1))
+      (should (= (car (car rows)) 1)))
+    (mysql-execute db "DROP TABLE test_async_dml")))
+
+(ert-deftest mysql-async-query-empty-result-test ()
+  "Async query on empty result set should work correctly."
+  (with-test-mysql-db db
+    (mysql-execute db "DROP TABLE IF EXISTS test_async_empty")
+    (mysql-execute db "CREATE TABLE test_async_empty (id INT)")
+    ;; Async SELECT on empty table
+    (let ((status (mysql-query-start db "SELECT * FROM test_async_empty")))
+      (while (eq status 'not-ready)
+        (setq status (mysql-query-continue db)))
+      (should (eq status 'complete)))
+    (let ((result-pair (mysql-store-result-start db)))
+      (while (eq (car result-pair) 'not-ready)
+        (setq result-pair (mysql-store-result-continue db)))
+      (should (eq (car result-pair) 'complete))
+      (let* ((res-ptr (cdr result-pair))
+             (result (mysql-async-result db res-ptr t)))
+        ;; Column names present, but no data rows
+        (should (equal (car result) '("id")))
+        (should-not (cdr result))))
+    (mysql-execute db "DROP TABLE test_async_empty")))
+
+(ert-deftest mysql-async-query-immediate-complete-test ()
+  "Fast queries may complete immediately on mysql-query-start."
+  (with-test-mysql-db db
+    ;; SELECT 1 should be instant
+    (let ((status (mysql-query-start db "SELECT 1 AS val")))
+      ;; May be 'complete or 'not-ready; both are valid
+      (while (eq status 'not-ready)
+        (setq status (mysql-query-continue db)))
+      (should (eq status 'complete)))
+    (let ((result-pair (mysql-store-result-start db)))
+      (while (eq (car result-pair) 'not-ready)
+        (setq result-pair (mysql-store-result-continue db)))
+      (should (eq (car result-pair) 'complete))
+      (let ((result (mysql-async-result db (cdr result-pair) t)))
+        (should (equal (car result) '("val")))
+        (should (= (length (cdr result)) 1))
+        (should (= (nth 0 (nth 1 result)) 1))))))
+
+(ert-deftest mysql-async-query-error-test ()
+  "Async query with bad SQL should return 'error or signal."
+  (with-test-mysql-db db
+    (let ((status (condition-case nil
+                      (mysql-query-start db "INVALID SQL GARBAGE")
+                    (error 'error))))
+      ;; Either the start itself errors, or it returns 'error
+      (if (eq status 'error)
+          (should t)  ; error was raised, expected
+        ;; Poll until complete or error
+        (while (eq status 'not-ready)
+          (setq status (condition-case nil
+                           (mysql-query-continue db)
+                         (error 'error))))
+        (should (eq status 'error))))))
+
+(ert-deftest mysql-async-field-count-test ()
+  "mysql-async-field-count should distinguish SELECT from DML."
+  (with-test-mysql-db db
+    ;; SELECT query
+    (let ((status (mysql-query-start db "SELECT 1, 2, 3")))
+      (while (eq status 'not-ready)
+        (setq status (mysql-query-continue db)))
+      (should (eq status 'complete)))
+    ;; field_count > 0 for SELECT
+    (should (> (mysql-async-field-count db) 0))
+    ;; Drain the result
+    (let ((pair (mysql-store-result-start db)))
+      (while (eq (car pair) 'not-ready)
+        (setq pair (mysql-store-result-continue db)))
+      (when (cdr pair)
+        (mysql-async-result db (cdr pair) nil)))
+    ;; DML query
+    (mysql-execute db "DROP TABLE IF EXISTS test_async_fc")
+    (mysql-execute db "CREATE TABLE test_async_fc (id INT)")
+    (let ((status (mysql-query-start db "INSERT INTO test_async_fc VALUES (1)")))
+      (while (eq status 'not-ready)
+        (setq status (mysql-query-continue db)))
+      (should (eq status 'complete)))
+    (let ((pair (mysql-store-result-start db)))
+      (while (eq (car pair) 'not-ready)
+        (setq pair (mysql-store-result-continue db))))
+    ;; field_count = 0 for DML
+    (should (= (mysql-async-field-count db) 0))
+    (mysql-execute db "DROP TABLE test_async_fc")))
+
 ;;; test.el ends here
