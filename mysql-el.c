@@ -27,20 +27,54 @@ signal_error (emacs_env *env, const char *msg)
   env->non_local_exit_signal (env, Qerror, data);
 }
 
+/* Signal a `mysql-error' with structured data: (ERRNO SQLSTATE ERRMSG).
+   Elisp callers receive (mysql-error ERRNO SQLSTATE ERRMSG) where:
+     ERRNO    — integer, the MySQL error code (mysql_errno)
+     SQLSTATE — string, the 5-character SQLSTATE (mysql_sqlstate)
+     ERRMSG   — string, the human-readable message (mysql_error)
+   This mirrors the Emacs built-in sqlite.c approach so that the Elisp
+   layer can format/display the error however it likes without needing
+   to re-query the connection handle (which may have been reset).  */
 static void
-signal_mysql_error (emacs_env *env, const char *prefix, MYSQL *conn)
+signal_mysql_error (emacs_env *env, MYSQL *conn)
 {
+  unsigned int eno = mysql_errno (conn);
+  const char *state = mysql_sqlstate (conn);
   const char *err = mysql_error (conn);
-  size_t len = strlen (prefix) + strlen (err) + 4;
-  char *buf = malloc (len);
-  if (buf)
-    {
-      snprintf (buf, len, "%s: %s", prefix, err);
-      signal_error (env, buf);
-      free (buf);
-    }
-  else
-    signal_error (env, err);
+
+  emacs_value Qmysql_error = env->intern (env, "mysql-error");
+  emacs_value Qlist = env->intern (env, "list");
+
+  emacs_value errno_val = env->make_integer (env, (intmax_t) eno);
+  emacs_value state_val = env->make_string (env, state, strlen (state));
+  emacs_value msg_val   = env->make_string (env, err, strlen (err));
+
+  emacs_value list_args[] = { errno_val, state_val, msg_val };
+  emacs_value data = env->funcall (env, Qlist, 3, list_args);
+
+  env->non_local_exit_signal (env, Qmysql_error, data);
+}
+
+/* Signal a `mysql-error' for a prepared statement.
+   Uses mysql_stmt_errno/sqlstate/error for the details.  */
+static void
+signal_mysql_stmt_error (emacs_env *env, MYSQL_STMT *stmt)
+{
+  unsigned int eno = mysql_stmt_errno (stmt);
+  const char *state = mysql_stmt_sqlstate (stmt);
+  const char *err = mysql_stmt_error (stmt);
+
+  emacs_value Qmysql_error = env->intern (env, "mysql-error");
+  emacs_value Qlist = env->intern (env, "list");
+
+  emacs_value errno_val = env->make_integer (env, (intmax_t) eno);
+  emacs_value state_val = env->make_string (env, state, strlen (state));
+  emacs_value msg_val   = env->make_string (env, err, strlen (err));
+
+  emacs_value list_args[] = { errno_val, state_val, msg_val };
+  emacs_value data = env->funcall (env, Qlist, 3, list_args);
+
+  env->non_local_exit_signal (env, Qmysql_error, data);
 }
 
 /* ------------------------------------------------------------------ */
@@ -205,7 +239,7 @@ Fmysql_open (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
   if (!mysql_real_connect (conn, host, user, password, database, port,
                            NULL, CLIENT_MULTI_STATEMENTS))
     {
-      signal_mysql_error (env, "mysql_real_connect failed", conn);
+      signal_mysql_error (env, conn);
       mysql_close (conn);
       free (host); free (user); free (password); free (database);
       return env->intern (env, "nil");
@@ -449,15 +483,14 @@ Fmysql_execute (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
       MYSQL_STMT *stmt = mysql_stmt_init (conn);
       if (!stmt)
         {
-          signal_mysql_error (env, "mysql_stmt_init", conn);
+          signal_mysql_error (env, conn);
           free (query);
           return env->intern (env, "nil");
         }
 
       if (mysql_stmt_prepare (stmt, query, strlen (query)))
         {
-          const char *err = mysql_stmt_error (stmt);
-          signal_error (env, err);
+          signal_mysql_stmt_error (env, stmt);
           mysql_stmt_close (stmt);
           free (query);
           return env->intern (env, "nil");
@@ -473,7 +506,7 @@ Fmysql_execute (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
 
       if (mysql_stmt_bind_param (stmt, bb.binds))
         {
-          signal_error (env, mysql_stmt_error (stmt));
+          signal_mysql_stmt_error (env, stmt);
           free_bind_buf (&bb);
           mysql_stmt_close (stmt);
           free (query);
@@ -482,7 +515,7 @@ Fmysql_execute (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
 
       if (mysql_stmt_execute (stmt))
         {
-          signal_error (env, mysql_stmt_error (stmt));
+          signal_mysql_stmt_error (env, stmt);
           free_bind_buf (&bb);
           mysql_stmt_close (stmt);
           free (query);
@@ -567,7 +600,7 @@ Fmysql_execute (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
   /* Simple (non-prepared) path.  */
   if (mysql_real_query (conn, query, strlen (query)))
     {
-      signal_mysql_error (env, "mysql_real_query failed", conn);
+      signal_mysql_error (env, conn);
       free (query);
       return env->intern (env, "nil");
     }
@@ -599,7 +632,7 @@ Fmysql_execute (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
         }
       else
         {
-          signal_mysql_error (env, "mysql_store_result failed", conn);
+          signal_mysql_error (env, conn);
           return env->intern (env, "nil");
         }
     }
@@ -639,14 +672,14 @@ Fmysql_select (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
       MYSQL_STMT *stmt = mysql_stmt_init (conn);
       if (!stmt)
         {
-          signal_mysql_error (env, "mysql_stmt_init", conn);
+          signal_mysql_error (env, conn);
           free (query);
           return env->intern (env, "nil");
         }
 
       if (mysql_stmt_prepare (stmt, query, strlen (query)))
         {
-          signal_error (env, mysql_stmt_error (stmt));
+          signal_mysql_stmt_error (env, stmt);
           mysql_stmt_close (stmt);
           free (query);
           return env->intern (env, "nil");
@@ -662,7 +695,7 @@ Fmysql_select (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
 
       if (mysql_stmt_bind_param (stmt, bb.binds))
         {
-          signal_error (env, mysql_stmt_error (stmt));
+          signal_mysql_stmt_error (env, stmt);
           free_bind_buf (&bb);
           mysql_stmt_close (stmt);
           free (query);
@@ -671,7 +704,7 @@ Fmysql_select (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
 
       if (mysql_stmt_execute (stmt))
         {
-          signal_error (env, mysql_stmt_error (stmt));
+          signal_mysql_stmt_error (env, stmt);
           free_bind_buf (&bb);
           mysql_stmt_close (stmt);
           free (query);
@@ -802,7 +835,7 @@ Fmysql_select (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
   /* Simple path (no bind parameters).  */
   if (mysql_real_query (conn, query, strlen (query)))
     {
-      signal_mysql_error (env, "mysql_real_query failed", conn);
+      signal_mysql_error (env, conn);
       free (query);
       return env->intern (env, "nil");
     }
@@ -816,7 +849,7 @@ Fmysql_select (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
       MYSQL_RES *res = mysql_use_result (conn);
       if (!res)
         {
-          signal_mysql_error (env, "mysql_use_result failed", conn);
+          signal_mysql_error (env, conn);
           return env->intern (env, "nil");
         }
       struct mysql_set *set = calloc (1, sizeof *set);
@@ -843,7 +876,7 @@ Fmysql_select (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
   MYSQL_RES *res = mysql_store_result (conn);
   if (!res)
     {
-      signal_mysql_error (env, "mysql_store_result failed", conn);
+      signal_mysql_error (env, conn);
       return env->intern (env, "nil");
     }
 
@@ -906,7 +939,7 @@ Fmysql_next (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
         }
       if (ret != 0 && ret != MYSQL_DATA_TRUNCATED)
         {
-          signal_error (env, mysql_stmt_error (set->stmt));
+          signal_mysql_stmt_error (env, set->stmt);
           set->eof = true;
           return env->intern (env, "nil");
         }
@@ -1066,7 +1099,7 @@ Fmysql_execute_batch (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
 
   if (mysql_real_query (conn, stmts, strlen (stmts)))
     {
-      signal_mysql_error (env, "mysql_real_query failed", conn);
+      signal_mysql_error (env, conn);
       free (stmts);
       return env->intern (env, "nil");
     }
@@ -1083,7 +1116,7 @@ Fmysql_execute_batch (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
       else if (mysql_field_count (conn) != 0)
         {
           /* A query that should return results failed.  */
-          signal_mysql_error (env, "execute-batch result error", conn);
+          signal_mysql_error (env, conn);
           return env->intern (env, "nil");
         }
       int status = mysql_next_result (conn);
@@ -1091,7 +1124,7 @@ Fmysql_execute_batch (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
         break;            /* no more results */
       if (status > 0)
         {
-          signal_mysql_error (env, "execute-batch next_result error", conn);
+          signal_mysql_error (env, conn);
           return env->intern (env, "nil");
         }
       /* status == 0: more results, continue loop */
@@ -1109,7 +1142,7 @@ mysql_simple_exec (emacs_env *env, MYSQL *conn, const char *sql)
 {
   if (mysql_real_query (conn, sql, strlen (sql)))
     {
-      signal_mysql_error (env, sql, conn);
+      signal_mysql_error (env, conn);
       return env->intern (env, "nil");
     }
   return env->intern (env, "t");
@@ -1249,11 +1282,20 @@ Fmysql_query_start (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
   switch (status)
     {
     case NET_ASYNC_COMPLETE:
+      /* The query phase completed, but the server may have returned
+         an error (e.g. ERROR 1690 BIGINT out of range).  Check errno
+         so that the caller sees an Emacs error instead of silently
+         falling through to the result-fetch path.  */
+      if (mysql_errno (conn))
+        {
+          signal_mysql_error (env, conn);
+          return env->intern (env, "error");
+        }
       return env->intern (env, "complete");
     case NET_ASYNC_NOT_READY:
       return env->intern (env, "not-ready");
     default:
-      signal_mysql_error (env, "mysql_real_query_nonblocking", conn);
+      signal_mysql_error (env, conn);
       return env->intern (env, "error");
     }
 }
@@ -1280,11 +1322,16 @@ Fmysql_query_continue (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
   switch (status)
     {
     case NET_ASYNC_COMPLETE:
+      if (mysql_errno (conn))
+        {
+          signal_mysql_error (env, conn);
+          return env->intern (env, "error");
+        }
       return env->intern (env, "complete");
     case NET_ASYNC_NOT_READY:
       return env->intern (env, "not-ready");
     default:
-      signal_mysql_error (env, "mysql_real_query_nonblocking", conn);
+      signal_mysql_error (env, conn);
       return env->intern (env, "error");
     }
 }
@@ -1320,14 +1367,26 @@ Fmysql_store_result_start (emacs_env *env, ptrdiff_t nargs,
       if (res)
         result_val = env->make_user_ptr (env, NULL, res);
       else
-        result_val = env->intern (env, "nil");
+        {
+          /* res is NULL.  This is normal for non-SELECT statements
+             (field_count == 0).  But if field_count != 0, the query
+             was a SELECT that failed — report the error.  */
+          if (mysql_field_count (conn) != 0)
+            {
+              /* Always use signal_mysql_error — even if errno is 0
+                 the structured data format will carry that info.  */
+              signal_mysql_error (env, conn);
+              return env->intern (env, "nil");
+            }
+          result_val = env->intern (env, "nil");
+        }
       break;
     case NET_ASYNC_NOT_READY:
       status_sym = env->intern (env, "not-ready");
       result_val = env->intern (env, "nil");
       break;
     default:
-      signal_mysql_error (env, "mysql_store_result_nonblocking", conn);
+      signal_mysql_error (env, conn);
       return env->intern (env, "nil");
     }
 
@@ -1370,7 +1429,7 @@ Fmysql_async_result (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
           my_ulonglong affected = mysql_affected_rows (conn);
           return env->make_integer (env, (intmax_t) affected);
         }
-      signal_mysql_error (env, "No result set", conn);
+      signal_mysql_error (env, conn);
       return env->intern (env, "nil");
     }
 
@@ -1436,6 +1495,23 @@ Fmysql_async_field_count (emacs_env *env, ptrdiff_t nargs,
       return env->intern (env, "nil");
     }
   return env->make_integer (env, (intmax_t) mysql_field_count (conn));
+}
+
+/* (mysql-warning-count DB) → INTEGER
+   Return the number of warnings generated by the most recent
+   statement on DB.  Returns 0 when there are no warnings.  */
+static emacs_value
+Fmysql_warning_count (emacs_env *env, ptrdiff_t nargs, emacs_value args[],
+                      void *data)
+{
+  (void) nargs; (void) data;
+  MYSQL *conn = env->get_user_ptr (env, args[0]);
+  if (!conn)
+    {
+      signal_error (env, "Invalid or closed database object");
+      return env->intern (env, "nil");
+    }
+  return env->make_integer (env, (intmax_t) mysql_warning_count (conn));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1602,6 +1678,38 @@ emacs_module_init (struct emacs_runtime *ert)
     "Return field_count after async query (0 = not a SELECT).\n"
     "(mysql-async-field-count DB)",
                                      NULL));
+
+  bind_function (env, "mysql-warning-count",
+                 env->make_function (env, 1, 1, Fmysql_warning_count,
+    "Return the number of warnings from the most recent statement on DB.\n"
+    "(mysql-warning-count DB)\n"
+    "Returns 0 when there are no warnings.",
+                                     NULL));
+
+  /* Define the `mysql-error' error symbol.
+     Equivalent to: (define-error 'mysql-error "MySQL error" 'error)
+     which expands to:
+       (put 'mysql-error 'error-conditions '(mysql-error error))
+       (put 'mysql-error 'error-message "MySQL error")  */
+  {
+    emacs_value Qput = env->intern (env, "put");
+    emacs_value Qmysql_error = env->intern (env, "mysql-error");
+
+    /* (put 'mysql-error 'error-conditions '(mysql-error error)) */
+    emacs_value Qerror_conditions = env->intern (env, "error-conditions");
+    emacs_value Qerror = env->intern (env, "error");
+    emacs_value Qlist = env->intern (env, "list");
+    emacs_value cond_args[] = { Qmysql_error, Qerror };
+    emacs_value conds = env->funcall (env, Qlist, 2, cond_args);
+    emacs_value put_args1[] = { Qmysql_error, Qerror_conditions, conds };
+    env->funcall (env, Qput, 3, put_args1);
+
+    /* (put 'mysql-error 'error-message "MySQL error") */
+    emacs_value Qerror_message = env->intern (env, "error-message");
+    emacs_value msg = env->make_string (env, "MySQL error", 11);
+    emacs_value put_args2[] = { Qmysql_error, Qerror_message, msg };
+    env->funcall (env, Qput, 3, put_args2);
+  }
 
   provide (env, "mysql-el");
   return 0;
