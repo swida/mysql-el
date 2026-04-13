@@ -2,29 +2,21 @@
 
 An Emacs dynamic module providing a native MySQL client API, with an interface style consistent with Emacs's built-in `sqlite.c`.
 
+Every I/O function supports both **synchronous** (blocking) and **asynchronous** (non-blocking) modes through an optional `ASYNC` parameter — same function name, one extra argument.
+
 ## Table of Contents
 
 - [Building & Installation](#building--installation)
-- [Quick Start: A Complete Example](#quick-start-a-complete-example)
+- [Quick Start](#quick-start)
 - [API Reference](#api-reference)
-  - [mysql-available-p](#mysql-available-p)
-  - [mysql-version](#mysql-version)
-  - [mysql-open](#mysql-open)
-  - [mysql-close](#mysql-close)
-  - [mysqlp](#mysqlp)
-  - [mysql-execute](#mysql-execute)
-  - [mysql-select](#mysql-select)
-  - [mysql-next](#mysql-next)
-  - [mysql-more-p](#mysql-more-p)
-  - [mysql-columns](#mysql-columns)
-  - [mysql-finalize](#mysql-finalize)
-  - [mysql-execute-batch](#mysql-execute-batch)
-  - [mysql-transaction](#mysql-transaction)
-  - [mysql-commit](#mysql-commit)
-  - [mysql-rollback](#mysql-rollback)
-  - [mysql-escape-string](#mysql-escape-string)
+  - [Connection](#connection) — `mysql-open`, `mysql-open-poll`, `mysql-close`, `mysqlp`, `mysql-available-p`, `mysql-version`
+  - [Query](#query) — `mysql-query`, `mysql-query-poll`
+  - [Convenience Aliases](#convenience-aliases-sync-with-prepared-statement-support) — `mysql-execute`, `mysql-select`
+  - [Set Objects (Cursor)](#set-objects-cursor) — `mysql-next`, `mysql-more-p`, `mysql-columns`, `mysql-finalize`
+  - [Batch & Transactions](#batch--transactions) — `mysql-execute-batch`, `mysql-transaction`, `mysql-commit`, `mysql-rollback`
+  - [Utility](#utility) — `mysql-escape-string`, `mysql-warning-count`
 - [Error Handling](#error-handling)
-- [Asynchronous (Non-blocking) API](#asynchronous-non-blocking-api)
+- [Data Type Mapping](#data-type-mapping)
 - [Running Tests](#running-tests)
 
 ---
@@ -33,175 +25,80 @@ An Emacs dynamic module providing a native MySQL client API, with an interface s
 
 ### Prerequisites
 
-- GNU Emacs source (built with dynamic module support, i.e. `--with-modules`) — the module needs Emacs C headers (`emacs-module.h`, etc.)
+- GNU Emacs source (built with dynamic module support, i.e. `--with-modules`)
 - MySQL client library (`libmysqlclient`) and its header files
 - GCC
 - `makeinfo` (Texinfo, for generating `.info` documentation)
 
 ### Configuring the Makefile
 
-Before building, edit the two path variables at the top of the `Makefile` to point to your environment:
+Edit the two path variables at the top of the `Makefile`:
 
 ```makefile
-# Emacs source root directory (needs src/emacs-module.h)
-ROOT = $(HOME)/emacs
-
-# MySQL installation directory (needs include/ and lib/)
-MYSQL_DIR = $(HOME)/mysqlinst
-```
-
-| Variable | Description | Required Contents |
-|----------|-------------|-------------------|
-| `ROOT` | Emacs source root directory | Must contain `src/emacs-module.h` |
-| `MYSQL_DIR` | MySQL installation directory | Must contain `include/mysql.h` and `lib/libmysqlclient.so` |
-
-For example, if your Emacs source is at `/opt/emacs-30` and MySQL is installed at `/usr/local/mysql`:
-
-```makefile
-ROOT = /opt/emacs-30
-MYSQL_DIR = /usr/local/mysql
+ROOT = $(HOME)/emacs          # Emacs source root (needs src/emacs-module.h)
+MYSQL_DIR = $(HOME)/mysqlinst  # MySQL install dir (needs include/ and lib/)
 ```
 
 ### Building
 
 ```bash
 cd mysql-el
-
-# If MySQL is installed in a non-standard path, export the library path first
-export LD_LIBRARY_PATH=$MYSQL_DIR/lib   # adjust to your actual path
-
+export LD_LIBRARY_PATH=$MYSQL_DIR/lib
 make
 ```
 
-A successful build produces:
-- `mysql-el.o` — object file
-- `mysql-el.so` — dynamic module (loaded into Emacs)
-- `mysql-el.info` — Info-format documentation
-
-To clean build artifacts:
-
-```bash
-make clean
-```
+Produces: `mysql-el.so` (dynamic module), `mysql-el.info` (documentation).
 
 ### Loading the Module
 
 ```elisp
-;; Option 1: Load the .so directly
-(module-load "/path/to/mysql-el.so")
-
-;; Option 2: Add to load-path and require
-(add-to-list 'load-path "/path/to/modules/mysql-el/")
+(add-to-list 'load-path "/path/to/mysql-el/")
 (require 'mysql-el)
 ```
 
 ---
 
-## Quick Start: A Complete Example
-
-The following example walks through an "employee management" scenario — from table creation, insertion, querying, updating, transactions, to closing — covering all core APIs.
+## Quick Start
 
 ```elisp
-;; 0. Load the module
-(module-load "mysql-el.so")
+(require 'mysql-el)
 
-;; 1. Connect to the database
-(setq db (mysql-open "127.0.0.1" "root" "" "emacs_test" 3306))
+;; Connect (sync)
+(setq db (mysql-open "127.0.0.1" "root" "" "mydb" 3306))
 
-;; 2. Create table (DDL)
-(mysql-execute db "DROP TABLE IF EXISTS employees")
-(mysql-execute db
-  "CREATE TABLE employees (
-     id    INT PRIMARY KEY AUTO_INCREMENT,
-     name  VARCHAR(100) NOT NULL,
-     dept  VARCHAR(50),
-     salary DOUBLE
-   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+;; Connect (async — Emacs stays responsive)
+(setq db (mysql-open "10.0.0.1" "root" "" "mydb" 3306 t))
+(while (eq (mysql-open-poll db) 'not-ready) (sit-for 0.02))
 
-;; 3. Insert data — returns the number of affected rows
-(mysql-execute db "INSERT INTO employees (name, dept, salary)
-                   VALUES ('Alice', 'Engineering', 25000.50)")
-;; => 1
+;; Query (sync) — returns a plist
+(mysql-query db "SELECT * FROM users")
+;; => (:type select :columns ("id" "name") :rows ((1 "Alice") (2 "Bob")) :warning-count 0)
 
-(mysql-execute db "INSERT INTO employees (name, dept, salary)
-                   VALUES ('Bob', 'Product', 22000)")
-;; => 1
+;; Query (async)
+(mysql-query db "SELECT * FROM big_table" t)
+(let (result)
+  (while (eq (setq result (mysql-query-poll db)) 'not-ready)
+    (sit-for 0.02))
+  (plist-get result :rows))
 
-;; 4. Insert with bound parameters (Prepared Statement) for safety
-;;    Parameters are passed as a list; supports string / integer / float / nil
-(mysql-execute db
-  "INSERT INTO employees (name, dept, salary) VALUES (?, ?, ?)"
-  '("Charlie" "Engineering" 30000.0))
-;; => 1
+;; Convenience aliases (sync, support prepared statements)
+(mysql-execute db "INSERT INTO t VALUES (?, ?)" '(1 "foo"))  ;; => 1
+(mysql-select db "SELECT * FROM t" nil 'full)
+;; => (("id" "name") (1 "foo"))
 
-;; 5. Basic query — returns a list of rows, each row is a list
-(mysql-select db "SELECT * FROM employees ORDER BY id")
-;; => (("Alice" "Engineering" 25000.5)
-;;     ("Bob" "Product" 22000.0)
-;;     ("Charlie" "Engineering" 30000.0))
-;;  Note: INT columns are automatically converted to Emacs integers
-
-;; 6. Query with column names (full mode)
-(mysql-select db "SELECT name, salary FROM employees" nil 'full)
-;; => (("name" "salary")          ; <-- first element is the column name list
-;;     ("Alice" 25000.5)
-;;     ("Bob" 22000.0)
-;;     ("Charlie" 30000.0))
-
-;; 7. Parameterized conditional query
-(mysql-select db
-  "SELECT name, salary FROM employees WHERE dept = ?"
-  '("Engineering"))
-;; => (("Alice" 25000.5)
-;;     ("Charlie" 30000.0))
-
-;; 8. Update data — returns the number of affected rows
-(mysql-execute db
-  "UPDATE employees SET salary = salary * 1.1 WHERE dept = 'Engineering'")
-;; => 2
-
-;; 9. Transaction: batch operations with rollback on error
+;; Transactions
 (mysql-transaction db)
+(mysql-execute db "INSERT INTO t VALUES (2, 'bar')")
+(mysql-commit db)
+
+;; Error handling
 (condition-case err
-    (progn
-      (mysql-execute db "INSERT INTO employees (name, dept, salary)
-                         VALUES ('Diana', 'Finance', 20000)")
-      (mysql-execute db "INSERT INTO employees (name, dept, salary)
-                         VALUES ('Eve', 'Finance', 21000)")
-      (mysql-commit db)
-      (message "Transaction committed successfully"))
-  (error
-   (mysql-rollback db)
-   (message "Transaction rolled back: %s" (error-message-string err))))
+    (mysql-execute db "BAD SQL")
+  (mysql-error
+   (message "ERROR %d (%s): %s"
+            (nth 1 err) (nth 2 err) (nth 3 err))))
 
-;; 10. Batch execute multiple statements (semicolon-separated)
-(mysql-execute-batch db
-  "INSERT INTO employees (name, dept, salary) VALUES ('Frank', 'HR', 19000);
-   INSERT INTO employees (name, dept, salary) VALUES ('Grace', 'HR', 18500);")
-
-;; 11. Use set mode to iterate over large result sets row by row
-;;     (without loading everything into memory at once)
-(let ((set (mysql-select db "SELECT id, name, salary FROM employees ORDER BY id"
-                         nil 'set)))
-  (unwind-protect
-      (progn
-        (message "Columns: %S" (mysql-columns set))
-        (while (mysql-more-p set)
-          (let ((row (mysql-next set)))
-            (when row
-              (message "Row: %S" row)))))
-    (mysql-finalize set)))
-
-;; 12. String escaping (for dynamic SQL construction; prefer bound parameters)
-(mysql-escape-string db "it's a \"test\"")
-;; => "it\\'s a \\\"test\\\""
-
-;; 13. View final results
-(mysql-select db "SELECT id, name, dept, salary FROM employees ORDER BY id"
-              nil 'full)
-
-;; 14. Clean up and close
-(mysql-execute db "DROP TABLE employees")
+;; Close
 (mysql-close db)
 ```
 
@@ -209,546 +106,152 @@ The following example walks through an "employee management" scenario — from t
 
 ## API Reference
 
-### mysql-available-p
+### Connection
+
+#### mysql-open
 
 ```
-(mysql-available-p) → t
+(mysql-open HOST USER PASSWORD &optional DATABASE PORT ASYNC) → DB
 ```
 
-Check whether the MySQL module is loaded and available. Always returns `t` once loaded.
-
----
-
-### mysql-version
-
-```
-(mysql-version) → STRING
-```
-
-Return the MySQL client library version string, e.g. `"8.0.36"`.
-
----
-
-### mysql-open
-
-```
-(mysql-open HOST USER PASSWORD &optional DATABASE PORT TIMEOUT) → DB
-```
-
-Open a MySQL connection and return a database handle object.
+Open a MySQL connection. Returns a database handle object.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | HOST | string | Host address, e.g. `"127.0.0.1"` |
 | USER | string | Username |
-| PASSWORD | string | Password; pass `""` for no password |
-| DATABASE | string \| nil | Optional, default database name |
-| PORT | integer \| nil | Optional, defaults to 3306 |
-| TIMEOUT | integer \| nil | Optional, read/write/connect timeout in seconds (0 or nil = no timeout) |
+| PASSWORD | string | Password; `""` for no password |
+| DATABASE | string \| nil | Default database |
+| PORT | integer \| nil | TCP port (default 3306) |
+| ASYNC | non-nil \| nil | Non-nil for non-blocking connect |
 
-**Features:**
-- The connection charset is automatically set to `utf8mb4`
-- The connection is opened with `CLIENT_MULTI_STATEMENTS`, enabling `mysql-execute-batch`
-- When the connection object is garbage collected, `mysql_close` is called automatically
-- When TIMEOUT is set, `MYSQL_OPT_READ_TIMEOUT`, `MYSQL_OPT_WRITE_TIMEOUT`, and `MYSQL_OPT_CONNECT_TIMEOUT` are configured, preventing indefinite blocking when the server is unresponsive
+When ASYNC is nil, the call blocks until the connection is established or fails. When ASYNC is non-nil, the call returns immediately with a handle in "connecting" state — poll with `mysql-open-poll` until ready.
+
+The connection is automatically configured with `utf8mb4` charset and `CLIENT_MULTI_STATEMENTS` mode. The handle is garbage-collection safe (`mysql_close` is called by the finalizer).
 
 ```elisp
-;; Minimal usage (3 required parameters)
-(setq db (mysql-open "127.0.0.1" "root" ""))
+;; Sync
+(setq db (mysql-open "127.0.0.1" "root" "" "mydb" 3306))
 
-;; Full usage
-(setq db (mysql-open "127.0.0.1" "root" "mypassword" "mydb" 3306))
-
-;; With 30-second timeout (prevents Emacs from hanging)
-(setq db (mysql-open "127.0.0.1" "root" "mypassword" "mydb" 3306 30))
+;; Async
+(setq db (mysql-open "10.0.0.1" "root" "" "mydb" 3306 t))
+(while (eq (mysql-open-poll db) 'not-ready) (sit-for 0.02))
 ```
 
----
+#### mysql-open-poll
 
-### mysql-close
+```
+(mysql-open-poll DB) → 'not-ready | 'complete
+```
+
+Poll an async connect. Returns `'complete` when the connection is established. Signals `mysql-error` on failure.
+
+#### mysql-close
 
 ```
 (mysql-close DB) → t
 ```
 
-Close the database connection. Operating on the handle after closing will signal an error.
+Close the connection. Always synchronous.
 
-```elisp
-(mysql-close db)  ;; => t
-(mysql-execute db "SELECT 1")  ;; => error: Invalid or closed database object
-```
-
----
-
-### mysqlp
+#### mysqlp
 
 ```
 (mysqlp OBJECT) → t | nil
 ```
 
-Test whether an object is an **active** MySQL connection handle.
+Return `t` if OBJECT is a live MySQL connection handle.
 
-```elisp
-(mysqlp db)      ;; => t
-(mysqlp "hello") ;; => nil
-(mysqlp 42)      ;; => nil
+#### mysql-available-p
+
 ```
+(mysql-available-p) → t
+```
+
+Return `t` if the MySQL module is loaded.
+
+#### mysql-version
+
+```
+(mysql-version) → STRING
+```
+
+Return the MySQL client library version string (e.g. `"8.0.36"`).
 
 ---
 
-### mysql-execute
+### Query
+
+The unified query API. Same function for sync and async — the `ASYNC` parameter selects the mode.
+
+#### mysql-query
+
+```
+(mysql-query DB SQL &optional ASYNC) → plist | 'not-ready
+```
+
+Execute SQL on DB.
+
+| ASYNC | Behavior | Return |
+|-------|----------|--------|
+| nil | Synchronous (blocking) | Result plist |
+| non-nil | Non-blocking start | `'not-ready`, or result plist if query completed instantly |
+
+**Result plist:**
+
+```elisp
+;; SELECT
+(:type select
+ :columns ("id" "name" "salary")
+ :rows ((1 "Alice" 95000.0) (2 "Bob" 88000.0))
+ :warning-count 0)
+
+;; DML / DDL
+(:type dml
+ :affected-rows 3
+ :warning-count 2)
+```
+
+The `:warning-count` is always included — no need for a separate `mysql-warning-count` call.
+
+```elisp
+;; Sync
+(let ((r (mysql-query db "SELECT * FROM t")))
+  (plist-get r :rows))
+
+;; Async
+(mysql-query db "SELECT * FROM big_table" t)
+(let (r)
+  (while (eq (setq r (mysql-query-poll db)) 'not-ready)
+    (sit-for 0.02))
+  (plist-get r :rows))
+```
+
+#### mysql-query-poll
+
+```
+(mysql-query-poll DB) → 'not-ready | plist
+```
+
+Poll an async query started by `mysql-query`. Returns `'not-ready` while in progress, or the result plist when complete. Signals `mysql-error` on failure.
+
+Internally manages both the query phase and the store-result phase — the caller only needs one poll loop.
+
+---
+
+### Convenience Aliases (sync, with prepared statement support)
+
+These are synchronous-only convenience functions that support prepared statements (`?` placeholders). They return results in the traditional format (not plists), matching the style of Emacs's built-in `sqlite-execute` / `sqlite-select`.
+
+#### mysql-execute
 
 ```
 (mysql-execute DB QUERY &optional VALUES) → INTEGER | LIST
 ```
 
-Execute a single SQL statement.
+Execute a SQL statement. Returns affected row count (integer) for DML/DDL, or a list of rows for SELECT.
 
-**Return value:**
-- **DDL / INSERT / UPDATE / DELETE**: returns the number of affected rows (integer)
-- **SELECT**: returns a list of rows (same as `mysql-select`, but without `full` mode)
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| DB | user-ptr | Database connection handle |
-| QUERY | string | SQL statement, may contain `?` placeholders |
-| VALUES | list \| nil | Optional, list of bound parameters |
-
-**Bound parameter types:**
-
-| Elisp Type | MySQL Type |
-|------------|-----------|
-| `string` | MYSQL_TYPE_STRING |
-| `integer` | MYSQL_TYPE_LONGLONG |
-| `float` | MYSQL_TYPE_DOUBLE |
-| `nil` | MYSQL_TYPE_NULL |
-
-```elisp
-;; DDL
-(mysql-execute db "CREATE TABLE t (id INT, name TEXT)")
-
-;; INSERT, returns affected row count
-(mysql-execute db "INSERT INTO t VALUES (1, 'foo')")  ;; => 1
-
-;; INSERT with bound parameters
-(mysql-execute db "INSERT INTO t VALUES (?, ?)" '(2 "bar"))  ;; => 1
-
-;; DELETE, returns deleted row count
-(mysql-execute db "DELETE FROM t WHERE id > 1")  ;; => 1
-
-;; SELECT (not recommended; prefer mysql-select)
-(mysql-execute db "SELECT * FROM t")  ;; => ((1 "foo"))
-```
-
----
-
-### mysql-select
-
-```
-(mysql-select DB QUERY &optional VALUES RETURN-TYPE) → LIST | SET
-```
-
-Execute a SELECT query, designed specifically for reading data.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| DB | user-ptr | Database connection handle |
-| QUERY | string | SELECT statement, may contain `?` placeholders |
-| VALUES | list \| nil | Optional, list of bound parameters |
-| RETURN-TYPE | symbol \| nil | `nil` = data rows only; `'full` = first element is column names; `'set` = return a cursor object |
-
-**Normal mode** (RETURN-TYPE = nil):
-
-```elisp
-(mysql-select db "SELECT name, age FROM users")
-;; => (("Alice" 30) ("Bob" 25))
-```
-
-**Full mode** (RETURN-TYPE = 'full):
-
-```elisp
-(mysql-select db "SELECT name, age FROM users" nil 'full)
-;; => (("name" "age")      ; <-- column names
-;;     ("Alice" 30)
-;;     ("Bob" 25))
-```
-
-**Set mode** (RETURN-TYPE = 'set) — for large result sets:
-
-Returns a set object (cursor) that fetches data row by row via `mysql-next`, avoiding loading the entire result set into memory at once. Usage is similar to SQLite's `sqlite-next` / `sqlite-more-p`.
-
-```elisp
-(let ((set (mysql-select db "SELECT * FROM big_table" nil 'set)))
-  (unwind-protect
-      (while (mysql-more-p set)
-        (let ((row (mysql-next set)))
-          (when row
-            (message "Row: %S" row))))
-    (mysql-finalize set)))
-```
-
-**Parameterized query:**
-
-```elisp
-(mysql-select db "SELECT * FROM users WHERE age > ?" '(20))
-;; => (("Alice" 30) ("Bob" 25))
-```
-
-**Empty result set:**
-
-```elisp
-;; Normal mode: returns nil
-(mysql-select db "SELECT * FROM empty_table")  ;; => nil
-
-;; Full mode: still returns column names, but no data rows
-(mysql-select db "SELECT * FROM empty_table" nil 'full)
-;; => (("col1" "col2"))
-```
-
----
-
-### mysql-next
-
-```
-(mysql-next SET) → LIST | nil
-```
-
-Fetch the next row from a set object, returning a list. Returns `nil` when all rows have been consumed.
-
-```elisp
-(let ((set (mysql-select db "SELECT id, name FROM users" nil 'set)))
-  (mysql-next set)  ;; => (1 "Alice")
-  (mysql-next set)  ;; => (2 "Bob")
-  (mysql-next set)  ;; => nil (no more data)
-  (mysql-finalize set))
-```
-
----
-
-### mysql-more-p
-
-```
-(mysql-more-p SET) → t | nil
-```
-
-Test whether the set object has more data to fetch. Returns `nil` after `mysql-next` has returned `nil`.
-
-```elisp
-(while (mysql-more-p set)
-  (let ((row (mysql-next set)))
-    (when row (process-row row))))
-```
-
----
-
-### mysql-columns
-
-```
-(mysql-columns SET) → LIST
-```
-
-Return the list of column names for a set object.
-
-```elisp
-(let ((set (mysql-select db "SELECT id, name FROM users" nil 'set)))
-  (mysql-columns set)  ;; => ("id" "name")
-  (mysql-finalize set))
-```
-
----
-
-### mysql-finalize
-
-```
-(mysql-finalize SET) → t
-```
-
-Release all resources held by the set object. The set cannot be used after this call.
-
-> **Note:** Even without calling this function explicitly, resources are automatically released when the set object is garbage collected. However, it is recommended to call this explicitly in `unwind-protect` to release database connection resources as early as possible.
-
-```elisp
-(let ((set (mysql-select db "SELECT * FROM t" nil 'set)))
-  (unwind-protect
-      (while (mysql-more-p set)
-        (let ((row (mysql-next set)))
-          (when row (process-row row))))
-    (mysql-finalize set)))
-```
-
----
-
-### mysql-execute-batch
-
-```
-(mysql-execute-batch DB STATEMENTS) → t
-```
-
-Execute multiple semicolon-separated SQL statements. Suitable for initialization scripts, batch DDL, etc.
-
-```elisp
-(mysql-execute-batch db
-  "CREATE TABLE a (id INT);
-   CREATE TABLE b (id INT);
-   INSERT INTO a VALUES (1);")
-;; => t
-```
-
-> **Note:** This function does not support bound parameters. For parameterized execution, use `mysql-execute` for each statement individually.
-
----
-
-### mysql-transaction
-
-```
-(mysql-transaction DB) → t
-```
-
-Begin a transaction (executes `START TRANSACTION`).
-
----
-
-### mysql-commit
-
-```
-(mysql-commit DB) → t
-```
-
-Commit the current transaction (executes `COMMIT`). Calling this without an active transaction does not signal an error.
-
----
-
-### mysql-rollback
-
-```
-(mysql-rollback DB) → t
-```
-
-Roll back the current transaction (executes `ROLLBACK`).
-
-**Transaction usage pattern:**
-
-```elisp
-(mysql-transaction db)
-(condition-case err
-    (progn
-      (mysql-execute db "INSERT INTO t VALUES (1)")
-      (mysql-execute db "INSERT INTO t VALUES (2)")
-      (mysql-commit db))
-  (error
-   (mysql-rollback db)
-   (signal (car err) (cdr err))))
-```
-
----
-
-### mysql-escape-string
-
-```
-(mysql-escape-string DB STRING) → STRING
-```
-
-Escape a string for safe use in MySQL queries, preventing SQL injection. The escaping respects the current connection's character set.
-
-```elisp
-(mysql-escape-string db "it's a \"test\"")
-;; => "it\\'s a \\\"test\\\""
-```
-
-> **Best practice:** Prefer using the `?` bound parameters of `mysql-execute` / `mysql-select`. Only use this function when dynamic SQL construction is unavoidable.
-
----
-
-## Asynchronous (Non-blocking) API
-
-Requires MySQL 8.0.16+ `libmysqlclient` which provides `_nonblocking` functions. These functions return immediately without blocking Emacs, allowing the editor to remain responsive during long-running queries.
-
-### Overview
-
-A typical async query involves three phases:
-
-1. **Query phase**: `mysql-query-start` / `mysql-query-continue` — send the SQL to the server
-2. **Store phase**: `mysql-store-result-start` / `mysql-store-result-continue` — fetch the result set into client memory
-3. **Result phase**: `mysql-async-result` — convert the stored result to Elisp (no I/O, instant)
-
-```elisp
-;; Phase 1: start query (non-blocking)
-(let ((status (mysql-query-start db "SELECT * FROM users")))
-  (while (eq status 'not-ready)
-    (sit-for 0.02)  ; yield to Emacs event loop
-    (setq status (mysql-query-continue db)))
-  ;; status is now 'complete or 'error
-
-  ;; Phase 2: fetch result set (non-blocking)
-  (let ((pair (mysql-store-result-start db)))
-    (while (eq (car pair) 'not-ready)
-      (sit-for 0.02)
-      (setq pair (mysql-store-result-continue db)))
-    ;; (car pair) is 'complete, (cdr pair) is the result pointer
-
-    ;; Phase 3: convert to Elisp list (instant, no I/O)
-    (let ((result (mysql-async-result db (cdr pair) t)))
-      ;; result = (("col1" "col2") (val1 val2) ...)
-      result)))
-```
-
-### mysql-query-start
-
-```
-(mysql-query-start DB SQL) → symbol
-```
-
-Begin an asynchronous query. Returns immediately with one of:
-- `'complete` — the query finished instantly (fast path)
-- `'not-ready` — still in progress, call `mysql-query-continue` to poll
-- `'error` — the query failed (an Emacs error is also signaled)
-
----
-
-### mysql-query-continue
-
-```
-(mysql-query-continue DB) → symbol
-```
-
-Continue a previously started asynchronous query. Returns `'complete`, `'not-ready`, or `'error`. Call repeatedly (e.g. on a timer) until the status is no longer `'not-ready`.
-
----
-
-### mysql-store-result-start
-
-```
-(mysql-store-result-start DB) → (STATUS . RESULT-PTR)
-```
-
-Begin asynchronously fetching the result set into client memory. Returns a cons cell:
-- `STATUS` — `'complete`, `'not-ready`, or `'error`
-- `RESULT-PTR` — when complete, a user-ptr to the `MYSQL_RES` (or `nil` for non-SELECT queries)
-
----
-
-### mysql-store-result-continue
-
-```
-(mysql-store-result-continue DB) → (STATUS . RESULT-PTR)
-```
-
-Continue fetching the result set. Same return format as `mysql-store-result-start`.
-
----
-
-### mysql-async-result
-
-```
-(mysql-async-result DB RESULT-PTR &optional FULL) → LIST
-```
-
-Convert an already-stored `MYSQL_RES` into an Emacs list. **This does not perform any I/O** — the data is already in client memory, so this call is instant.
-
-| Parameter | Description |
-|-----------|-------------|
-| DB | Database connection handle |
-| RESULT-PTR | The result pointer from `mysql-store-result-start/continue` |
-| FULL | If non-nil, include column names as the first element (like `mysql-select` with `'full`) |
-
-After this call, the result set is freed and `RESULT-PTR` is invalidated.
-
-```elisp
-;; Without FULL:
-(mysql-async-result db res-ptr nil)
-;; => ((1 "Alice") (2 "Bob"))
-
-;; With FULL:
-(mysql-async-result db res-ptr t)
-;; => (("id" "name") (1 "Alice") (2 "Bob"))
-```
-
----
-
-### mysql-async-affected-rows
-
-```
-(mysql-async-affected-rows DB) → INTEGER
-```
-
-After an async non-SELECT query completes, return the number of affected rows.
-
----
-
-### mysql-async-field-count
-
-```
-(mysql-async-field-count DB) → INTEGER
-```
-
-After an async query completes, return the field count. Returns 0 for non-SELECT queries (INSERT/UPDATE/DELETE/DDL), and a positive number for SELECT queries.
-
-Use this to distinguish SELECT from DML after an async query:
-
-```elisp
-(if (> (mysql-async-field-count db) 0)
-    ;; SELECT — fetch result with mysql-async-result
-    ...
-  ;; DML — get affected rows with mysql-async-affected-rows
-  ...)
-```
-
----
-
-### mysql-warning-count
-
-```
-(mysql-warning-count DB) → INTEGER
-```
-
-Return the number of warnings generated by the most recently executed statement on DB. Returns 0 when there are no warnings.
-
-```elisp
-(mysql-warning-count db)  ;; => 2
-```
-
----
-
-## Error Handling
-
-### Error Symbol: `mysql-error`
-
-The module defines a dedicated error symbol `mysql-error` (inheriting from `error`) with structured data. This is modeled after Emacs's built-in SQLite error handling (`sqlite-error`).
-
-When a MySQL error occurs, the module signals:
-
-```
-(mysql-error ERRNO SQLSTATE ERRMSG)
-```
-
-where:
-- **ERRNO** — integer, the MySQL error code (e.g. `1690`)
-- **SQLSTATE** — string, the 5-character SQLSTATE code (e.g. `"22003"`)
-- **ERRMSG** — string, the human-readable error message
-
-This means the Elisp caller can extract error details directly from the signal data, without needing to re-query the connection handle (which may have been reset):
-
-```elisp
-(condition-case err
-    (mysql-execute db "SELECT * FROM t WHERE col + 1 > 300")
-  (mysql-error
-   (let ((errno   (nth 1 err))    ; e.g. 1690
-         (sqlstate (nth 2 err))   ; e.g. "22003"
-         (errmsg   (nth 3 err)))  ; e.g. "BIGINT value is out of range..."
-     (message "ERROR %d (%s): %s" errno sqlstate errmsg))))
-```
-
-Prepared statement errors (`mysql_stmt_errno` / `mysql_stmt_sqlstate` / `mysql_stmt_error`) use the same `mysql-error` symbol and data format.
-
-Generic programming errors (e.g. "Invalid or closed database object", "malloc failed") still signal the standard `error` symbol with a string message.
-
----
-
-## Data Type Mapping
-
-### Write Direction (Elisp → MySQL)
-
-Type mapping when passing values via `?` bound parameters:
+VALUES is an optional list of bind parameters (`?` placeholders):
 
 | Elisp Type | MySQL Bind Type |
 |------------|-----------------|
@@ -757,43 +260,177 @@ Type mapping when passing values via `?` bound parameters:
 | `float` | MYSQL_TYPE_DOUBLE |
 | `nil` | MYSQL_TYPE_NULL |
 
-### Read Direction (MySQL → Elisp)
+```elisp
+(mysql-execute db "INSERT INTO t VALUES (?, ?)" '(1 "foo"))  ;; => 1
+(mysql-execute db "DELETE FROM t WHERE id > 1")               ;; => 1
+```
 
-Automatic type conversion for query results (`mysql-select`, non-prepared path):
+#### mysql-select
 
-| MySQL Type | Elisp Type |
-|-----------|-----------|
-| TINY / SHORT / INT / LONG / BIGINT | `integer` |
-| FLOAT / DOUBLE / DECIMAL | `float` |
-| TEXT / VARCHAR / CHAR / DATE / ... | `string` |
-| NULL | `nil` |
+```
+(mysql-select DB QUERY &optional VALUES RETURN-TYPE) → LIST | SET
+```
 
-> **Note:** Results from the prepared statement path are all returned as `string` (except NULL which is `nil`), because MySQL's stmt API uses a unified `MYSQL_TYPE_STRING` buffer for receiving data.
+Execute a SELECT query. RETURN-TYPE controls the format:
+
+| RETURN-TYPE | Returns |
+|-------------|---------|
+| nil | `((row1) (row2) ...)` |
+| `'full` | `((columns) (row1) (row2) ...)` — first element is column names |
+| `'set` | A cursor object for lazy row-by-row iteration |
+
+```elisp
+(mysql-select db "SELECT * FROM t" nil 'full)
+;; => (("id" "name") (1 "Alice") (2 "Bob"))
+
+(mysql-select db "SELECT * FROM t WHERE id = ?" '(1))
+;; => (("Alice"))
+```
+
+---
+
+### Set Objects (Cursor)
+
+For lazy iteration over large result sets without loading all rows into memory.
+
+```elisp
+(let ((set (mysql-select db "SELECT * FROM big_table" nil 'set)))
+  (unwind-protect
+      (progn
+        (message "Columns: %S" (mysql-columns set))
+        (while (mysql-more-p set)
+          (let ((row (mysql-next set)))
+            (when row (message "Row: %S" row)))))
+    (mysql-finalize set)))
+```
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `mysql-next` | `(SET) → list \| nil` | Fetch next row; nil when exhausted |
+| `mysql-more-p` | `(SET) → t \| nil` | Non-nil if more rows available |
+| `mysql-columns` | `(SET) → list` | Column names as list of strings |
+| `mysql-finalize` | `(SET) → t` | Free resources (recommended in `unwind-protect`) |
+
+---
+
+### Batch & Transactions
+
+#### mysql-execute-batch
+
+```
+(mysql-execute-batch DB STATEMENTS) → t
+```
+
+Execute multiple semicolon-separated SQL statements. Does not support bind parameters.
+
+```elisp
+(mysql-execute-batch db "CREATE TABLE a (id INT); CREATE TABLE b (id INT);")
+```
+
+#### mysql-transaction / mysql-commit / mysql-rollback
+
+```
+(mysql-transaction DB) → t    ;; START TRANSACTION
+(mysql-commit DB) → t         ;; COMMIT
+(mysql-rollback DB) → t       ;; ROLLBACK
+```
+
+```elisp
+(mysql-transaction db)
+(condition-case err
+    (progn
+      (mysql-execute db "INSERT INTO t VALUES (1)")
+      (mysql-execute db "INSERT INTO t VALUES (2)")
+      (mysql-commit db))
+  (mysql-error
+   (mysql-rollback db)
+   (signal (car err) (cdr err))))
+```
+
+---
+
+### Utility
+
+#### mysql-escape-string
+
+```
+(mysql-escape-string DB STRING) → STRING
+```
+
+Escape a string for safe SQL inclusion. Prefer `?` bind parameters instead.
+
+#### mysql-warning-count
+
+```
+(mysql-warning-count DB) → INTEGER
+```
+
+Warning count from the most recent statement. Usually not needed — `mysql-query` includes `:warning-count` in the result plist.
+
+---
+
+## Error Handling
+
+The module defines a `mysql-error` error symbol (inheriting from `error`) with structured data:
+
+```
+(mysql-error ERRNO SQLSTATE ERRMSG)
+```
+
+| Field | Type | Example |
+|-------|------|---------|
+| ERRNO | integer | `1690` |
+| SQLSTATE | string | `"22003"` |
+| ERRMSG | string | `"BIGINT value is out of range..."` |
+
+```elisp
+(condition-case err
+    (mysql-query db "SELECT * FROM t WHERE col + 1 > 300")
+  (mysql-error
+   (let ((errno   (nth 1 err))
+         (sqlstate (nth 2 err))
+         (errmsg   (nth 3 err)))
+     (message "ERROR %d (%s): %s" errno sqlstate errmsg))))
+```
+
+Generic programming errors (`"Invalid or closed database object"`, `"malloc failed"`, `"Connection busy"`) signal the standard `error` symbol.
+
+---
+
+## Data Type Mapping
+
+### Write: Elisp → MySQL (bind parameters)
+
+| Elisp | MySQL |
+|-------|-------|
+| `string` | MYSQL_TYPE_STRING (UTF-8) |
+| `integer` | MYSQL_TYPE_LONGLONG |
+| `float` | MYSQL_TYPE_DOUBLE |
+| `nil` | MYSQL_TYPE_NULL |
+
+### Read: MySQL → Elisp (query results)
+
+| MySQL | Elisp (non-prepared) | Elisp (prepared) |
+|-------|---------------------|------------------|
+| TINY / SHORT / INT / LONG / BIGINT / YEAR | `integer` | `string` |
+| FLOAT / DOUBLE / DECIMAL | `float` | `string` |
+| TEXT / VARCHAR / DATE / JSON / ... | `string` | `string` |
+| NULL | `nil` | `nil` |
+
+> **Note:** The prepared statement path returns all non-NULL values as strings because MySQL's stmt API uses a uniform string buffer.
 
 ---
 
 ## Running Tests
 
-The module includes 30 unit tests covering connections, CRUD, Unicode, transactions, batch execution, cursor iteration, and more.
-
 ```bash
-# 1. Ensure the MySQL server is running and the emacs_test database exists
 mysql -u root -e "CREATE DATABASE IF NOT EXISTS emacs_test"
-
-# 2. Build the module
-cd mysql-el
-make
-
-# 3. Run all tests
-export LD_LIBRARY_PATH=$MYSQL_DIR/lib   # adjust to your actual MySQL path
+cd mysql-el && make
+export LD_LIBRARY_PATH=$MYSQL_DIR/lib
 emacs -batch -L . -l ert -l test.el -f ert-run-tests-batch-and-exit
-
-# 4. Run specific tests (matched by name regex)
-emacs -batch -L . -l ert -l test.el \
-  --eval '(ert-run-tests-batch-and-exit "mysql-param")'
 ```
 
-To modify connection parameters, edit the variables at the top of `test.el`:
+Connection parameters are at the top of `test.el`:
 
 ```elisp
 (defvar test-mysql-host "127.0.0.1")

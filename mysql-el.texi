@@ -34,13 +34,12 @@ shared library into Emacs.  @xref{Loading the Module}.
 @menu
 * Loading the Module::       How to build and load the MySQL module.
 * MySQL Connection::         Opening and closing database connections.
-* MySQL Execution::          Executing SQL statements.
-* MySQL Queries::            Selecting data from the database.
+* MySQL Query::              Unified query API (sync and async).
+* MySQL Convenience::        Sync aliases with prepared statement support.
 * MySQL Set Objects::        Lazy cursor iteration over result sets.
 * MySQL Batch Execution::    Running multiple statements at once.
 * MySQL Transactions::       Transaction support.
-* MySQL Utility Functions::  Escaping strings and version information.
-* MySQL Async API::          Non-blocking query execution.
+* MySQL Utility Functions::  Escaping, warnings, and version information.
 * MySQL Error Handling::     Error signals and structured error data.
 * MySQL Type Mapping::       How types are mapped between Emacs Lisp and MySQL.
 * MySQL Complete Example::   A complete example from start to finish.
@@ -91,7 +90,7 @@ loaded and is available in the current Emacs session.
 @cindex MySQL connection
 
 @cindex database object, MySQL
-@defun mysql-open host user password &optional database port timeout
+@defun mysql-open host user password &optional database port async
 Open a connection to a MySQL server and return a @dfn{database object}.
 @var{host} is the hostname or IP address of the MySQL server (e.g.,
 @code{"127.0.0.1"}).  @var{user} and @var{password} are the
@@ -102,32 +101,32 @@ The optional @var{database} argument, if non-@code{nil}, specifies the
 default database to use.  The optional @var{port} argument, if
 non-@code{nil}, specifies the TCP port number (default is 3306).
 
-The optional @var{timeout} argument, if a positive integer, sets the
-read, write, and connect timeout in seconds.  When the server is
-unresponsive (e.g., stopped in a debugger, network partition), the
-connection will time out instead of blocking Emacs indefinitely.
-A value of 0 or @code{nil} means no timeout.
+The optional @var{async} argument, if non-@code{nil}, initiates a
+non-blocking connect.  The returned database object is not yet ready
+for queries; use @code{mysql-open-poll} to poll until the connection
+is established.  This prevents Emacs from blocking when connecting to
+remote servers.
 
 The connection is automatically configured to use the @code{utf8mb4}
-character set, so that Unicode strings (including emoji and CJK
-characters) round-trip correctly.  The connection also enables
-multi-statement mode, which is required for @code{mysql-execute-batch}.
-
-The returned database object can be used as the first argument to all
-the subsequent functions described in this chapter.  If the object is
-garbage-collected, the underlying MySQL connection is automatically
-closed.
+character set.  The connection also enables multi-statement mode,
+which is required for @code{mysql-execute-batch}.
 
 @lisp
-;; Minimal: connect with 3 required arguments.
-(setq db (mysql-open "127.0.0.1" "root" ""))
+;; Synchronous connect (blocks).
+(setq db (mysql-open "127.0.0.1" "root" "" "mydb" 3306))
 
-;; Full: specify database and port.
-(setq db (mysql-open "127.0.0.1" "root" "secret" "mydb" 3306))
-
-;; With 30-second timeout:
-(setq db (mysql-open "127.0.0.1" "root" "secret" "mydb" 3306 30))
+;; Asynchronous connect (non-blocking).
+(setq db (mysql-open "10.0.0.1" "root" "" "mydb" 3306 t))
+(while (eq (mysql-open-poll db) 'not-ready)
+  (sit-for 0.02))
 @end lisp
+@end defun
+
+@defun mysql-open-poll db
+Poll an asynchronous connect started by @code{mysql-open}.  Returns
+@code{not-ready} while the connection is still being established, or
+@code{complete} when it is ready.  Signals @code{mysql-error} on
+failure.
 @end defun
 
 @defun mysqlp object
@@ -156,141 +155,103 @@ is garbage-collected.
 @end lisp
 @end defun
 
-@node MySQL Execution
-@section Executing SQL Statements
-@cindex executing SQL, MySQL
+@node MySQL Query
+@section Unified Query API
+@cindex query, MySQL
+@cindex mysql-query
+@cindex asynchronous query, MySQL
 
-@defun mysql-execute db query &optional values
-Execute the @acronym{SQL} @var{query} on @var{db}.  For instance:
+  The @code{mysql-query} function provides both synchronous and
+asynchronous query execution through a single interface.  The optional
+@var{async} parameter selects the mode.
 
-@lisp
-(mysql-execute db "insert into foo values ('bar', 2)")
-@end lisp
+@defun mysql-query db sql &optional async
+Execute @var{sql} on @var{db}.
 
-If the optional @var{values} parameter is present, it should be a list
-of values to bind to the @samp{?} placeholders in @var{query} using a
-prepared statement.  For instance:
+When @var{async} is @code{nil} (the default), the query is executed
+synchronously and the result is returned as a plist.  When @var{async}
+is non-@code{nil}, the query starts non-blockingly and the function
+returns @code{not-ready} (poll with @code{mysql-query-poll}).
 
-@lisp
-(mysql-execute db "insert into foo values (?, ?)" '("bar" 2))
-@end lisp
+The result plist has one of two forms:
 
-This has exactly the same effect as the previous example, but is more
-efficient and safer (because it doesn't involve any string parsing or
-interpolation).
+For @code{SELECT} queries:
+@code{(:type select :columns @var{col-list} :rows @var{row-list} :warning-count @var{n})}
 
-The supported types for bind parameters are: strings, integers,
-floating-point numbers, and @code{nil} (which binds as @acronym{SQL}
-@code{NULL}).
-
-@code{mysql-execute} returns different values depending on the type of
-statement:
-
-@itemize @bullet
-@item
-For @acronym{DDL} statements (@samp{CREATE TABLE}, @samp{DROP TABLE},
-etc.) and @acronym{DML} statements (@samp{INSERT}, @samp{UPDATE},
-@samp{DELETE}), it returns the number of affected rows as an integer.
-For instance, an @samp{INSERT} statement will typically return @samp{1},
-whereas an @samp{UPDATE} statement may return zero or a higher number.
-
-@item
-For @samp{SELECT} statements (in the non-prepared path), the matching
-rows are returned as a list of lists, similar to @code{mysql-select}.
-However, for read queries you should prefer @code{mysql-select}, which
-provides the additional @code{full} return mode.
-@end itemize
+For @code{INSERT}/@code{UPDATE}/@code{DELETE}/@acronym{DDL}:
+@code{(:type dml :affected-rows @var{n} :warning-count @var{n})}
 
 @lisp
-;; DDL returns 0
-(mysql-execute db "create table t (id int, name text)")
-    @result{} 0
+;; Synchronous query:
+(let ((r (mysql-query db "SELECT * FROM users")))
+  (plist-get r :rows))
 
-;; INSERT returns 1
-(mysql-execute db "insert into t values (1, 'foo')")
-    @result{} 1
-
-;; INSERT with bind parameters
-(mysql-execute db "insert into t values (?, ?)" '(2 "bar"))
-    @result{} 1
-
-;; UPDATE returns count of changed rows
-(mysql-execute db "update t set name = 'baz' where id <= 2")
-    @result{} 2
-
-;; DELETE returns count of deleted rows
-(mysql-execute db "delete from t where id = 1")
-    @result{} 1
+;; Asynchronous query:
+(mysql-query db "SELECT * FROM big_table" t)
+(let (r)
+  (while (eq (setq r (mysql-query-poll db)) 'not-ready)
+    (sit-for 0.02))
+  (plist-get r :rows))
 @end lisp
-
-Strings in this module are handled as @code{utf8mb4}, which means all
-text columns are encoded and decoded using UTF-8.  This correctly
-handles multi-byte characters including emoji.
 @end defun
 
-@node MySQL Queries
-@section Selecting Data
-@cindex selecting data, MySQL
+@defun mysql-query-poll db
+Poll an asynchronous query started by @code{mysql-query}.  Returns
+@code{not-ready} while the query is in progress, or the result plist
+when complete.  Signals @code{mysql-error} on failure.
+
+The function internally manages both the query phase and the
+store-result phase---the caller only needs a single poll loop.
+@end defun
+
+@node MySQL Convenience
+@section Convenience Aliases (Sync, Prepared Statements)
+@cindex mysql-execute
+@cindex mysql-select
+@cindex convenience aliases
+
+  These synchronous-only functions support prepared statements
+(@samp{?} placeholders) and return results in the traditional list
+format (not plists).  They match the style of Emacs's built-in
+@code{sqlite-execute} / @code{sqlite-select}.
+
+@defun mysql-execute db query &optional values
+Execute the @acronym{SQL} @var{query} on @var{db}.
+
+If the optional @var{values} parameter is present, it should be a list
+of values to bind to @samp{?} placeholders using a prepared statement.
+The supported types are strings, integers, floating-point numbers, and
+@code{nil} (which binds as @code{NULL}).
+
+Return value: for @acronym{DML}/@acronym{DDL}, an integer (affected
+rows); for @code{SELECT}, a list of row-lists.
+
+@lisp
+(mysql-execute db "INSERT INTO t VALUES (?, ?)" '(1 "foo"))
+    @result{} 1
+(mysql-execute db "DELETE FROM t WHERE id > 1")
+    @result{} 1
+@end lisp
+@end defun
 
 @defun mysql-select db query &optional values return-type
-Select data from @var{db} and return the result.  For instance:
+Select data from @var{db}.  @var{return-type} controls the result format:
+
+@table @code
+@item nil
+A list of rows: @code{((row1) (row2) ...)}.
+@item full
+First element is column names: @code{((columns) (row1) (row2) ...)}.
+@item set
+A cursor object for lazy row-by-row iteration (@pxref{MySQL Set Objects}).
+@end table
 
 @lisp
-(mysql-select db "select * from foo where key = 2")
-    @result{} (("bar" 2))
-@end lisp
+(mysql-select db "SELECT * FROM t" nil 'full)
+    @result{} (("id" "name") (1 "Alice") (2 "Bob"))
 
-As with @code{mysql-execute}, you can optionally pass in a list of
-values that will be bound to @samp{?} placeholders before executing the
-query:
-
-@lisp
-(mysql-select db "select * from foo where key = ?" '(2))
-    @result{} (("bar" 2))
-@end lisp
-
-This is usually more efficient and safer than the method used by the
-previous example.
-
-By default, this function returns a list of matching rows, where each
-row is a list of column values.  If @var{return-type} is @code{full},
-the names of the columns (as a list of strings) will be returned as the
-first element in the return value:
-
-@lisp
-(mysql-select db "select * from foo" nil 'full)
-    @result{} (("name" "key") ("bar" 2) ("baz" 3))
-@end lisp
-
-@noindent
-The first element @code{("name" "key")} is the list of column names,
-and the remaining elements are the data rows.
-
-If @var{return-type} is @code{set}, this function returns a
-@dfn{set object} (a cursor) that can be used to iterate over the result
-set one row at a time, without loading all rows into memory at once.
-This is especially useful for large result sets.  @xref{MySQL Set Objects}.
-
-@lisp
-(let ((set (mysql-select db "select * from foo" nil 'set)))
-  (unwind-protect
-      (while (mysql-more-p set)
-        (let ((row (mysql-next set)))
-          (when row (process-row row))))
-    (mysql-finalize set)))
-@end lisp
-
-If the result set is empty, the default mode returns @code{nil}, while
-the @code{full} mode returns a list containing only the column names:
-
-@lisp
-;; Default mode, empty table:
-(mysql-select db "select * from empty_table")
-    @result{} nil
-
-;; Full mode, empty table:
-(mysql-select db "select * from empty_table" nil 'full)
-    @result{} (("col1" "col2"))
+(mysql-select db "SELECT * FROM t WHERE id = ?" '(1))
+    @result{} (("Alice"))
 @end lisp
 @end defun
 
@@ -448,150 +409,25 @@ A typical transaction pattern looks like this:
 
 @defun mysql-escape-string db string
 Escape @var{string} for safe inclusion in an @acronym{SQL} statement on
-@var{db}.  The escaping takes the current connection character set into
-account.
+@var{db}.  Prefer @samp{?} bind parameters whenever possible.
 
 @lisp
 (mysql-escape-string db "it's a \"test\"")
     @result{} "it\\'s a \\\"test\\\""
 @end lisp
-
-@strong{Note:} You should prefer using bind parameters (@samp{?}
-placeholders) with @code{mysql-execute} or @code{mysql-select} whenever
-possible.  Use @code{mysql-escape-string} only when you must
-dynamically construct @acronym{SQL} strings that cannot use
-placeholders (e.g., dynamic table or column names).
 @end defun
 
 @defun mysql-version
-Return a string denoting the version of the MySQL client library linked
-with this module.
-
-@lisp
-(mysql-version)
-    @result{} "8.0.36"
-@end lisp
-@end defun
-
-@node MySQL Async API
-@section Asynchronous (Non-blocking) Query Execution
-@cindex asynchronous query, MySQL
-@cindex non-blocking query, MySQL
-
-  The asynchronous API allows executing MySQL queries without blocking
-Emacs.  This requires MySQL 8.0.16+ @code{libmysqlclient}, which
-provides @code{_nonblocking} functions internally.
-
-  A typical async query involves three phases:
-
-@enumerate
-@item
-@strong{Query phase}: Send the SQL to the server using
-@code{mysql-query-start} and @code{mysql-query-continue}.
-@item
-@strong{Store phase}: Fetch the result set into client memory using
-@code{mysql-store-result-start} and @code{mysql-store-result-continue}.
-@item
-@strong{Result phase}: Convert the stored result to Emacs Lisp using
-@code{mysql-async-result} (no I/O, instant).
-@end enumerate
-
-  Each function in the query and store phases returns immediately.  The
-caller is expected to poll using a timer or idle callback until the
-status is no longer @code{not-ready}.
-
-@lisp
-;; Complete async query example:
-(let ((status (mysql-query-start db "SELECT * FROM users")))
-  ;; Phase 1: poll until query completes
-  (while (eq status 'not-ready)
-    (sit-for 0.02)
-    (setq status (mysql-query-continue db)))
-  ;; Phase 2: fetch result set
-  (let ((pair (mysql-store-result-start db)))
-    (while (eq (car pair) 'not-ready)
-      (sit-for 0.02)
-      (setq pair (mysql-store-result-continue db)))
-    ;; Phase 3: convert to Elisp
-    (mysql-async-result db (cdr pair) t)))
-@end lisp
-
-@defun mysql-query-start db sql
-Begin an asynchronous query.  @var{sql} is the SQL string to execute.
-Returns a symbol:
-@itemize @bullet
-@item @code{complete} --- the query finished instantly (fast path).
-@item @code{not-ready} --- still in progress; call @code{mysql-query-continue}.
-@item @code{error} --- the query failed (an Emacs error is also signaled).
-@end itemize
-@end defun
-
-@defun mysql-query-continue db
-Continue a previously started asynchronous query on @var{db}.  Returns
-@code{complete}, @code{not-ready}, or @code{error}.  Call repeatedly
-until the status changes from @code{not-ready}.
-@end defun
-
-@defun mysql-store-result-start db
-Begin asynchronously fetching the result set into client memory.
-Returns a cons cell @code{(@var{status} . @var{result-ptr})}, where
-@var{status} is @code{complete}, @code{not-ready}, or @code{error},
-and @var{result-ptr} is a user-pointer to the @code{MYSQL_RES}
-(or @code{nil} for non-@code{SELECT} queries) when @var{status} is
-@code{complete}.
-@end defun
-
-@defun mysql-store-result-continue db
-Continue fetching the result set.  Returns the same cons cell format
-as @code{mysql-store-result-start}.
-@end defun
-
-@defun mysql-async-result db result-ptr &optional full
-Convert an already-stored @code{MYSQL_RES} (pointed to by
-@var{result-ptr}) into an Emacs Lisp list.  This function performs
-@strong{no I/O}---the data is already in client memory.
-
-If @var{full} is non-@code{nil}, the column names are included as
-the first element of the returned list (like @code{mysql-select} with
-@code{full} return-type).
-
-After this call, the result set is freed and @var{result-ptr} is
-invalidated.
-
-@lisp
-(mysql-async-result db res-ptr t)
-    @result{} (("id" "name") (1 "Alice") (2 "Bob"))
-@end lisp
-@end defun
-
-@defun mysql-async-affected-rows db
-After an asynchronous non-@code{SELECT} query completes, return the
-number of affected rows.
-@end defun
-
-@defun mysql-async-field-count db
-After an asynchronous query completes, return the field count.  Returns
-0 for non-@code{SELECT} queries (@code{INSERT}, @code{UPDATE},
-@code{DELETE}, @acronym{DDL}), and a positive number for @code{SELECT}
-queries.  Use this to distinguish between the two cases:
-
-@lisp
-(if (> (mysql-async-field-count db) 0)
-    ;; SELECT: use mysql-async-result
-    (mysql-async-result db res-ptr t)
-  ;; DML: use mysql-async-affected-rows
-  (mysql-async-affected-rows db))
-@end lisp
+Return a string denoting the version of the MySQL client library.
 @end defun
 
 @defun mysql-warning-count db
 Return the number of warnings generated by the most recently executed
 statement on @var{db}.  Returns 0 when there are no warnings.
 
-@lisp
-(mysql-warning-count db)
-    @result{} 2
-@end lisp
+When using @code{mysql-query}, the warning count is included in the
+result plist as @code{:warning-count}, so this function is typically
+not needed separately.
 @end defun
 
 @node MySQL Error Handling
